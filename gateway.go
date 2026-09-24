@@ -26,6 +26,8 @@ type Request struct {
 	// ResponseFormat 은 OpenAI response_format 을 그대로 받는다(json_object, json_schema 등).
 	// json_schema 를 지원하지 않는 provider 로 가면 json_object 로 낮춘다.
 	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+	// Reasoning 은 호출자가 원하는 추론 수준(off|on|low|medium|high). reasoning=inherit 인 step 만 따른다.
+	Reasoning string `json:"reasoning,omitempty"`
 	// NoExternal 이면 external provider step 을 건너뛴다(클라이언트 allow_external=false 와 같은 효과).
 	NoExternal bool `json:"no_external,omitempty"`
 }

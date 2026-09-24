@@ -113,7 +113,7 @@ type RouteConfig struct {
 type StepConfig struct {
 	Provider     string   `toml:"provider" yaml:"provider"`
 	Model        string   `toml:"model" yaml:"model"`         // 비우면 프로바이더 기본 모델
-	Reasoning    string   `toml:"reasoning" yaml:"reasoning"` // off | on | low | medium | high
+	Reasoning    string   `toml:"reasoning" yaml:"reasoning"` // off | on | low | medium | high | inherit(호출자가 보낸 값, 없으면 off)
 	MaxTokens    int      `toml:"max_tokens" yaml:"max_tokens"`
 	Temperature  *float64 `toml:"temperature" yaml:"temperature"`
 	Retries      int      `toml:"retries" yaml:"retries"`               // 429·5xx·네트워크 오류 재시도 횟수
@@ -244,9 +244,9 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("route %s step %d: model 없음", name, i))
 			}
 			switch s.Reasoning {
-			case "off", "on", "low", "medium", "high":
+			case "off", "on", "low", "medium", "high", "inherit":
 			default:
-				errs = append(errs, fmt.Errorf("route %s step %d: reasoning %q (off|on|low|medium|high)", name, i, s.Reasoning))
+				errs = append(errs, fmt.Errorf("route %s step %d: reasoning %q (off|on|low|medium|high|inherit)", name, i, s.Reasoning))
 			}
 		}
 	}

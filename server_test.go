@@ -355,3 +355,42 @@ func TestExternalBlocking(t *testing.T) {
 		t.Fatalf("X-LLMGW-No-External 헤더 → 403, got %d", hr.StatusCode)
 	}
 }
+
+func TestReasoningInherit(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "ok") })
+	pq := prov(f.srv.URL)
+	pq.Reasoning, pq.ReasoningMinTokens = "chat_template", 2048
+	pu := prov(f.srv.URL)
+	pu.Reasoning = "effort"
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"q": pq, "u": pu},
+		Routes: map[string]*RouteConfig{
+			"q": {Steps: []StepConfig{{Provider: "q", Reasoning: "inherit", MaxTokens: 500}}},
+			"u": {Steps: []StepConfig{{Provider: "u", Reasoning: "inherit"}}},
+		},
+	})
+	s := serve(t, g)
+	for _, body := range []string{
+		`{"model":"q","messages":[{"role":"user","content":"1"}],"chat_template_kwargs":{"enable_thinking":true}}`,
+		`{"model":"q","messages":[{"role":"user","content":"2"}]}`,
+		`{"model":"u","messages":[{"role":"user","content":"3"}],"reasoning_effort":"low"}`,
+		`{"model":"u","messages":[{"role":"user","content":"4"}],"chat_template_kwargs":{"enable_thinking":false}}`,
+	} {
+		if code, out := post(t, s.URL+"/v1/chat/completions", "", body); code != 200 {
+			t.Fatalf("%d %v", code, out)
+		}
+	}
+	b := f.bodies
+	if kw := b[0]["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != true || b[0]["max_tokens"].(float64) != 2048 {
+		t.Fatalf("호출자 enable_thinking=true 를 따라야 함: %v", b[0])
+	}
+	if kw := b[1]["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != false {
+		t.Fatalf("지정 없으면 off: %v", b[1])
+	}
+	if b[2]["reasoning_effort"] != "low" {
+		t.Fatalf("reasoning_effort 를 effort 방식 provider 로 전달해야 함: %v", b[2])
+	}
+	if _, ok := b[3]["reasoning_effort"]; ok {
+		t.Fatalf("enable_thinking=false 면 effort 를 보내지 않아야 함: %v", b[3])
+	}
+}

@@ -8,7 +8,9 @@ OpenAI 호환 엔드포인트 여러 개를 설정 파일(TOML 또는 YAML) 하�
 - **provider**: 엔드포인트 하나. 분당 요청 한도(`rpm`), 동시 처리 수(`max_concurrency`), 대기열(`max_queue`,
   `queue_timeout`), 서킷 브레이커(`breaker_failures`, `breaker_cooldown`), 추론 전달 방식(`reasoning`)을 가진다.
 - **route**: 호출 이름. `steps` 를 위에서부터 시도한다. 순서를 바꾸면 우선순위가 바뀐다.
-- **step**: provider + 추론(`off|on|low|medium|high`) + `max_tokens` + `retries` + `max_retry_wait`.
+- **step**: provider + 추론(`off|on|low|medium|high|inherit`) + `max_tokens` + `retries` + `max_retry_wait`.
+  `inherit` 는 호출자가 보낸 `chat_template_kwargs.enable_thinking` 이나 `reasoning_effort` 를 따른다(없으면 off).
+  기존 앱이 기능마다 추론을 켜고 끄던 것을 게이트웨이 뒤에서도 그대로 유지할 때 쓴다.
 - **client**: 게이트웨이를 부르는 서비스 하나. 서버 모드에서 Bearer 키로 식별하고, 허용 라우트(`routes`)·
   중계 허용 provider(`passthrough`)·자기 몫의 한도(`rpm`, `max_concurrency`, `max_queue`, `queue_timeout`)를 가진다.
   여러 서비스가 같은 외부 API 키를 나눠 쓸 때 provider 한도는 게이트웨이 한 곳에서 지키고,

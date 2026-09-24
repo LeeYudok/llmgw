@@ -87,6 +87,11 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		Temperature    *float64        `json:"temperature"`
 		Stream         bool            `json:"stream"`
 		ResponseFormat json.RawMessage `json:"response_format"`
+		// 호출자의 추론 설정 — reasoning=inherit step 이 따른다.
+		ReasoningEffort    string `json:"reasoning_effort"`
+		ChatTemplateKwargs struct {
+			EnableThinking *bool `json:"enable_thinking"`
+		} `json:"chat_template_kwargs"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "요청 JSON: "+err.Error())
@@ -100,6 +105,10 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		Client: client, Route: in.Model, Messages: in.Messages, MaxTokens: in.MaxTokens,
 		Temperature: in.Temperature, ResponseFormat: in.ResponseFormat,
 		NoExternal: isTrue(r.Header.Get("X-LLMGW-No-External")),
+		Reasoning:  in.ReasoningEffort,
+	}
+	if et := in.ChatTemplateKwargs.EnableThinking; et != nil && req.Reasoning == "" {
+		req.Reasoning = map[bool]string{true: "on", false: "off"}[*et]
 	}
 	resp, err := g.Call(r.Context(), req)
 	if err != nil {

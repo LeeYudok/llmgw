@@ -57,7 +57,14 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 	if req.MaxTokens > 0 {
 		maxTokens = req.MaxTokens
 	}
-	thinking := s.Reasoning != "off"
+	level := s.Reasoning
+	if level == "inherit" {
+		level = req.Reasoning
+		if level == "" {
+			level = "off"
+		}
+	}
+	thinking := level != "off"
 	if thinking && maxTokens < p.ReasoningMinTokens {
 		maxTokens = p.ReasoningMinTokens
 	}
@@ -89,7 +96,7 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 		body["chat_template_kwargs"] = kw
 	case "effort":
 		if thinking {
-			effort := s.Reasoning
+			effort := level
 			if effort == "on" {
 				effort = "medium"
 			}
