@@ -24,6 +24,7 @@ providers:
     reasoning: effort
     json_schema: false
     passthrough: true
+    external: true
     reasoning_min_tokens: 4096
     rpm: 50
     max_concurrency: 8
@@ -56,6 +57,7 @@ clients:
   web-app:
     api_key_env: LLMGW_KEY_WEB_APP
     routes: [fast, news-deep]
+    allow_external: false
   batch-worker:
     api_key_env: LLMGW_KEY_BATCH
     routes: [fast, news-deep]

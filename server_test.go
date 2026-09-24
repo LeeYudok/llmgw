@@ -3,6 +3,7 @@ package llmgw
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -283,5 +284,74 @@ func TestCheckSchemaRequired(t *testing.T) {
 	}
 	if err := checkSchema(`{"a":1,"b":2}`, s); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestExternalBlocking(t *testing.T) {
+	ext := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "external") })
+	in := newFake(t, func(n int64, w http.ResponseWriter) {
+		if n == 1 {
+			http.Error(w, "down", 500) // 첫 호출 실패 → 외부 허용이면 external 로 폴백
+			return
+		}
+		okJSON(w, "internal")
+	})
+	pe := prov(ext.srv.URL)
+	pe.External, pe.Passthrough = true, true
+	t.Setenv("KEY_OPEN", "k-open")
+	t.Setenv("KEY_CLOSED", "k-closed")
+	no := false
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"in": prov(in.srv.URL), "ext": pe},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "in"}, {Provider: "ext"}}}},
+		Clients: map[string]*ClientConfig{
+			"open":   {APIKeyEnv: "KEY_OPEN", Passthrough: []string{"ext"}},
+			"closed": {APIKeyEnv: "KEY_CLOSED", AllowExternal: &no, Passthrough: []string{"ext"}},
+		},
+	})
+	// 외부 허용: 내부 실패 → external 로 폴백
+	req := userReq("r", "a")
+	req.Client = "open"
+	resp, err := g.Call(t.Context(), req)
+	if err != nil || resp.Provider != "ext" {
+		t.Fatalf("open: resp=%+v err=%v", resp, err)
+	}
+	// 외부 차단 클라이언트: 내부만. 내부가 성공하면 그대로, external 은 건드리지 않는다.
+	req = userReq("r", "b")
+	req.Client = "closed"
+	resp, err = g.Call(t.Context(), req)
+	if err != nil || resp.Provider != "in" {
+		t.Fatalf("closed: resp=%+v err=%v", resp, err)
+	}
+	// 요청 단위 차단 + 내부 실패 → external 은 건너뛰고 전체 실패
+	bad := newFake(t, func(_ int64, w http.ResponseWriter) { http.Error(w, "down", 500) })
+	g2 := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"in": prov(bad.srv.URL), "ext": pe},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "in"}, {Provider: "ext"}}}},
+	})
+	req = userReq("r", "c")
+	req.NoExternal = true
+	calls := ext.calls.Load()
+	_, err = g2.Call(t.Context(), req)
+	var ce *ChainError
+	if !errors.As(err, &ce) || len(ce.Attempts) != 2 || ce.Attempts[1].Error != ErrExternalBlocked.Error() || ext.calls.Load() != calls {
+		t.Fatalf("NoExternal 이면 external 을 호출하지 않아야 함: err=%v", err)
+	}
+	// 서버: 헤더로 차단, 차단 클라이언트의 external passthrough 는 403
+	s := serve(t, g)
+	hreq, _ := http.NewRequest(http.MethodPost, s.URL+"/passthrough/ext/x", strings.NewReader("x"))
+	hreq.Header.Set("Authorization", "Bearer k-closed")
+	hr, _ := http.DefaultClient.Do(hreq)
+	hr.Body.Close()
+	if hr.StatusCode != 403 {
+		t.Fatalf("차단 클라이언트 external passthrough → 403, got %d", hr.StatusCode)
+	}
+	hreq, _ = http.NewRequest(http.MethodPost, s.URL+"/passthrough/ext/x", strings.NewReader("x"))
+	hreq.Header.Set("Authorization", "Bearer k-open")
+	hreq.Header.Set("X-LLMGW-No-External", "1")
+	hr, _ = http.DefaultClient.Do(hreq)
+	hr.Body.Close()
+	if hr.StatusCode != 403 {
+		t.Fatalf("X-LLMGW-No-External 헤더 → 403, got %d", hr.StatusCode)
 	}
 }

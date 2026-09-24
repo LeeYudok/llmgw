@@ -32,6 +32,7 @@ model            = "solar-pro4"
 reasoning        = "effort"          # reasoning_effort 미지정 = 추론 안 함(0.6s급)
 json_schema      = false             # json_schema 요청은 json_object 로 낮춰 보낸다
 passthrough      = true              # /passthrough/upstage/... 로 문서 파싱 등 전용 API 도 중계
+external         = true              # 외부로 나가는 provider — 외부 차단 요청·클라이언트는 건너뛴다
 reasoning_min_tokens = 4096
 rpm              = 50
 max_concurrency  = 8
@@ -92,10 +93,11 @@ retries    = 1
 # 게이트웨이를 부르는 서비스마다 하나. Bearer 키로 식별하고, 라우트·한도·통계를 따로 둔다.
 # clients 를 하나도 정의하지 않으면 인증 없이 전부 연다(127.0.0.1 전용일 때만).
 
-# 사용자가 기다리는 실시간 앱: 한도 없이, 빠른 라우트만
+# 사용자가 기다리는 실시간 앱: 한도 없이, 빠른 라우트만. 민감 데이터라 외부 provider 금지.
 [clients.web-app]
-api_key_env = "LLMGW_KEY_WEB_APP"
-routes      = ["fast", "news-deep"]
+api_key_env    = "LLMGW_KEY_WEB_APP"
+routes         = ["fast", "news-deep"]
+allow_external = false
 
 # 야간 배치: 몰려도 다른 클라이언트 몫을 남기도록 동시 4, 대기 32
 [clients.batch-worker]

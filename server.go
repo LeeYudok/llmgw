@@ -99,6 +99,7 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 	req := Request{
 		Client: client, Route: in.Model, Messages: in.Messages, MaxTokens: in.MaxTokens,
 		Temperature: in.Temperature, ResponseFormat: in.ResponseFormat,
+		NoExternal: isTrue(r.Header.Get("X-LLMGW-No-External")),
 	}
 	resp, err := g.Call(r.Context(), req)
 	if err != nil {
@@ -149,6 +150,10 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	}
 	if c := g.cfg.Clients[client]; c != nil && !c.allowsPassthrough(name) {
 		writeErr(w, http.StatusForbidden, "허용되지 않은 passthrough: "+name)
+		return
+	}
+	if p.External && (isTrue(r.Header.Get("X-LLMGW-No-External")) || (g.cfg.Clients[client] != nil && !g.cfg.Clients[client].externalAllowed())) {
+		writeErr(w, http.StatusForbidden, "외부 provider 차단: "+name)
 		return
 	}
 	if cg := g.clientGates[client]; cg != nil {
@@ -207,6 +212,14 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+func isTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

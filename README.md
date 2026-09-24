@@ -50,6 +50,17 @@ max_queue       = 32                  # 넘치면 즉시 429 (Retry-After: 5)
 호출 수·성공·실패·거절·토큰·대기 중 요청 수를 돌려준다. `log_path` 를 주면 요청 1건당 JSONL 한 줄
 (클라이언트, 라우트, 처리 provider, 지연, 토큰, 에러)을 남긴다. 프롬프트·응답 본문은 남기지 않는다.
 
+## 외부 provider 차단
+
+조직 밖으로 데이터가 나가는 provider 에 `external = true` 를 붙인다. 다음 경우 그 provider 의 step 은
+호출하지 않고 건너뛴다(시도 기록에 `외부 provider 차단` 으로 남는다). 내부 step 이 모두 실패하면 외부로
+폴백하지 않고 에러를 돌려준다.
+
+- 클라이언트에 `allow_external = false`
+- 요청 헤더 `X-LLMGW-No-External: 1` (라이브러리는 `Request.NoExternal = true`)
+
+passthrough 도 같은 규칙을 따른다(차단이면 403).
+
 ## response_format
 
 호출자가 보낸 `response_format` 을 그대로 받는다. `json_schema`(strict 포함)는 provider 에

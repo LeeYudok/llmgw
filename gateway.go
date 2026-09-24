@@ -26,6 +26,8 @@ type Request struct {
 	// ResponseFormat 은 OpenAI response_format 을 그대로 받는다(json_object, json_schema 등).
 	// json_schema 를 지원하지 않는 provider 로 가면 json_object 로 낮춘다.
 	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
+	// NoExternal 이면 external provider step 을 건너뛴다(클라이언트 allow_external=false 와 같은 효과).
+	NoExternal bool `json:"no_external,omitempty"`
 }
 
 // Response 는 최종 성공 응답과 거쳐온 시도 기록이다.
@@ -54,6 +56,9 @@ type Attempt struct {
 
 // ErrAllFailed 는 체인의 모든 step 이 실패했을 때 반환한다. errors.As 로 *ChainError 를 꺼낼 수 있다.
 var ErrAllFailed = errors.New("모든 step 실패")
+
+// ErrExternalBlocked 는 외부 차단 요청에서 external step 을 건너뛴 사유다.
+var ErrExternalBlocked = errors.New("외부 provider 차단")
 
 // ErrUnknownRoute 는 설정에 없는 라우트를 부를 때 반환한다.
 var ErrUnknownRoute = errors.New("라우트 없음")
@@ -160,6 +165,9 @@ func (g *Gateway) Call(ctx context.Context, req Request) (resp *Response, err er
 		if !c.allows(req.Route) {
 			return nil, fmt.Errorf("%w: client %q → route %q", ErrRouteNotAllowed, req.Client, req.Route)
 		}
+		if !c.externalAllowed() {
+			req.NoExternal = true
+		}
 		release, err := g.clientGates[req.Client].acquire(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -230,6 +238,10 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 		gt := g.gates[s.Provider]
 		body := buildBody(p, s, &req)
 		model, _ := body["model"].(string)
+		if p.External && req.NoExternal {
+			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: ErrExternalBlocked.Error()})
+			continue
+		}
 
 		for try := 0; ; try++ {
 			if err := ctx.Err(); err != nil {

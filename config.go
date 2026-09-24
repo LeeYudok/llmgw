@@ -58,6 +58,8 @@ type ProviderConfig struct {
 	// Passthrough — true 면 서버의 /passthrough/<provider>/<path> 로 OpenAI 형식이 아닌 API 도
 	// 이 provider 의 키·한도·대기열을 거쳐 그대로 중계한다(예: 문서 파싱 API).
 	Passthrough bool `toml:"passthrough" yaml:"passthrough"`
+	// External — 조직 밖으로 데이터가 나가는 provider(외부 API). 외부 차단 요청·클라이언트는 이 step 을 건너뛴다.
+	External bool `toml:"external" yaml:"external"`
 
 	Extra map[string]any `toml:"extra" yaml:"extra"` // 요청 body 에 그대로 합칠 추가 필드
 }
@@ -72,7 +74,11 @@ type ClientConfig struct {
 	MaxConcurrency int      `toml:"max_concurrency" yaml:"max_concurrency"` // 동시 요청 수(0 = 무제한)
 	MaxQueue       int      `toml:"max_queue" yaml:"max_queue"`             // 넘치면 즉시 429
 	QueueTimeout   Duration `toml:"queue_timeout" yaml:"queue_timeout"`
+	// AllowExternal — false 면 이 클라이언트의 요청은 external provider step 을 모두 건너뛴다(기본 true).
+	AllowExternal *bool `toml:"allow_external" yaml:"allow_external"`
 }
+
+func (c *ClientConfig) externalAllowed() bool { return c.AllowExternal == nil || *c.AllowExternal }
 
 // allows 는 라우트 허용 여부다.
 func (c *ClientConfig) allows(route string) bool {
