@@ -97,10 +97,6 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		writeErr(w, http.StatusBadRequest, "요청 JSON: "+err.Error())
 		return
 	}
-	if in.Stream {
-		writeErr(w, http.StatusBadRequest, "stream 은 지원하지 않는다")
-		return
-	}
 	req := Request{
 		Client: client, Route: in.Model, Messages: in.Messages, MaxTokens: in.MaxTokens,
 		Temperature: in.Temperature, ResponseFormat: in.ResponseFormat,
@@ -110,24 +106,13 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 	if et := in.ChatTemplateKwargs.EnableThinking; et != nil && req.Reasoning == "" {
 		req.Reasoning = map[bool]string{true: "on", false: "off"}[*et]
 	}
+	if in.Stream {
+		g.serveStream(w, r, req)
+		return
+	}
 	resp, err := g.Call(r.Context(), req)
 	if err != nil {
-		var ce *ChainError
-		switch {
-		case errors.As(err, &ce):
-			writeJSON(w, http.StatusBadGateway, map[string]any{
-				"error": map[string]any{"message": err.Error(), "type": "all_steps_failed"}, "attempts": ce.Attempts,
-			})
-		case errors.Is(err, ErrUnknownRoute):
-			writeErr(w, http.StatusNotFound, err.Error())
-		case errors.Is(err, ErrRouteNotAllowed):
-			writeErr(w, http.StatusForbidden, err.Error())
-		case errors.Is(err, ErrClientLimited):
-			w.Header().Set("Retry-After", "5")
-			writeErr(w, http.StatusTooManyRequests, err.Error())
-		default:
-			writeErr(w, http.StatusGatewayTimeout, err.Error())
-		}
+		g.writeCallErr(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -146,6 +131,51 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		},
 		"llmgw": map[string]any{"route": in.Model, "provider": resp.Provider, "cached": resp.Cached, "attempts": resp.Attempts},
 	})
+}
+
+// serveStream 은 provider 의 SSE 를 그대로 흘려보낸다. 스트림이 시작되기 전에 실패하면 일반 JSON 에러를 준다.
+func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, req Request) {
+	fl, _ := w.(http.Flusher)
+	headerSent := false
+	_, err := g.Stream(r.Context(), req, func(line []byte) error {
+		if !headerSent {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			headerSent = true
+		}
+		if _, err := w.Write(line); err != nil {
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		return nil
+	})
+	if headerSent {
+		return // 스트림이 시작된 뒤의 에러는 연결을 닫는 것으로 끝난다
+	}
+	g.writeCallErr(w, err)
+}
+
+// writeCallErr 는 Call·Stream 에러를 HTTP 상태로 옮긴다.
+func (g *Gateway) writeCallErr(w http.ResponseWriter, err error) {
+	var ce *ChainError
+	switch {
+	case errors.As(err, &ce):
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"error": map[string]any{"message": err.Error(), "type": "all_steps_failed"}, "attempts": ce.Attempts,
+		})
+	case errors.Is(err, ErrUnknownRoute):
+		writeErr(w, http.StatusNotFound, err.Error())
+	case errors.Is(err, ErrRouteNotAllowed):
+		writeErr(w, http.StatusForbidden, err.Error())
+	case errors.Is(err, ErrClientLimited):
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusTooManyRequests, err.Error())
+	default:
+		writeErr(w, http.StatusGatewayTimeout, err.Error())
+	}
 }
 
 // handlePassthrough 는 provider API 를 그대로 중계한다. 인증 헤더만 provider 키로 바꾸고,

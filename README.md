@@ -108,7 +108,11 @@ curl -s localhost:17902/v1/chat/completions -d '{"model":"news-deep","messages":
 curl -s localhost:17902/stats
 ```
 
-응답의 `llmgw` 필드에 실제 처리한 provider·캐시 여부·시도 기록이 들어 있다. `stream` 은 지원하지 않는다.
+응답의 `llmgw` 필드에 실제 처리한 provider·캐시 여부·시도 기록이 들어 있다.
+
+`"stream": true` 면 provider 의 SSE 를 그대로 흘려보낸다. 첫 바이트를 받기 전의 실패(연결 오류·429·5xx)는
+평소처럼 재시도·폴백하고, 스트림이 시작된 뒤 끊기면 다른 provider 로 이어붙이지 않는다(부분 응답을 섞지 않는다).
+스트림 응답에는 검증·캐시를 적용하지 않는다. 라이브러리는 `Gateway.Stream` 을 쓴다.
 
 키는 provider 의 `api_key_env` 환경변수에서 읽는다. `-env` 로 지정한 KEY=VALUE 파일은 환경변수에 없는 키만 채운다.
 

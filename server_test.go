@@ -394,3 +394,56 @@ func TestReasoningInherit(t *testing.T) {
 		t.Fatalf("enable_thinking=false 면 effort 를 보내지 않아야 함: %v", b[3])
 	}
 }
+
+func sseFake(t *testing.T, fail bool) *fakeLLM {
+	return newFake(t, func(_ int64, w http.ResponseWriter) {
+		if fail {
+			http.Error(w, "down", 503)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, tok := range []string{"안", "녕"} {
+			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", tok)
+			w.(http.Flusher).Flush()
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+}
+
+func TestStreamFallbackBeforeFirstByte(t *testing.T) {
+	bad, good := sseFake(t, true), sseFake(t, false)
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(bad.srv.URL), "b": prov(good.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a", Retries: 1}, {Provider: "b"}}}},
+	})
+	s := serve(t, g)
+	resp, err := http.Post(s.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"r","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "text/event-stream" {
+		t.Fatalf("status %d ct %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if !strings.Contains(string(body), `"안"`) || !strings.Contains(string(body), "[DONE]") {
+		t.Fatalf("SSE 본문 %q", body)
+	}
+	if bad.calls.Load() != 2 || good.bodies[0]["stream"] != true {
+		t.Fatalf("a 재시도 후 b 로 스트림: a=%d b.stream=%v", bad.calls.Load(), good.bodies[0]["stream"])
+	}
+}
+
+func TestStreamAllFailedIsJSONError(t *testing.T) {
+	bad := sseFake(t, true)
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(bad.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	s := serve(t, g)
+	code, out := post(t, s.URL+"/v1/chat/completions", "", `{"model":"r","stream":true,"messages":[{"role":"user","content":"x"}]}`)
+	if code != 502 || out["attempts"] == nil {
+		t.Fatalf("스트림 시작 전 전부 실패면 502 JSON: %d %v", code, out)
+	}
+}
