@@ -1,0 +1,85 @@
+# llmgw 설정 예시 — 자체 호스팅 vLLM 1대 + 외부 API(Upstage) 1개를 묶는 샘플. 값은 예시다.
+# 키 값은 여기 쓰지 않는다. api_key_env 에 환경변수 이름만 적는다.
+
+[server]
+addr = "127.0.0.1:17902"
+# api_key_env = "LLMGW_API_KEY"   # 설정하면 서버 호출에 Bearer 로 요구
+
+# ── 프로바이더 ─────────────────────────────────────────────────────────────
+
+# 자체 호스팅 vLLM 예시. 동시 처리 수·대기열은 GPU 성능에 맞춰 조정한다.
+# 긴 입력(1만 토큰+) prefill 은 합계 ~1,400 tok/s 로 고정이라 동시 수를 넉넉히 줘도 줄만 선다.
+[providers.qwen]
+base_url         = "http://localhost:8000/v1"
+api_key_env      = "VLLM_API_KEY"
+model            = "Qwen/Qwen3.8-27B-FP8"
+reasoning        = "chat_template"   # enable_thinking on/off
+reasoning_min_tokens = 4096          # 추론 시 생각에 1~3K 토큰을 쓰므로 본문이 잘리지 않게
+max_concurrency  = 12
+max_queue        = 64
+queue_timeout    = "60s"
+timeout          = "180s"
+breaker_failures = 5
+breaker_cooldown = "30s"
+
+# Upstage: 분당 100요청 한도를 다른 서비스와 같은 키로 나눠 쓰는 경우 → 여기선 절반만 쓴다.
+[providers.upstage]
+base_url         = "https://api.upstage.ai/v1"
+api_key_env      = "UPSTAGE_API_KEY"
+model            = "solar-pro4"
+reasoning        = "effort"          # reasoning_effort 미지정 = 추론 안 함(0.6s급)
+reasoning_min_tokens = 4096
+rpm              = 50
+max_concurrency  = 8
+max_queue        = 16                # 넘치면 기다리지 않고 다음 step(qwen)으로
+queue_timeout    = "15s"
+timeout          = "60s"
+breaker_failures = 3
+breaker_cooldown = "60s"
+
+# ── 라우트 ─────────────────────────────────────────────────────────────────
+# steps 는 위에서부터 시도한다. 순서를 바꾸면 우선순위가 바뀐다.
+
+# 대량·실시간: 뉴스 감정분류, 짧은 JSON. 추론 끔.
+[routes.fast]
+cache_ttl = "10m"
+[[routes.fast.steps]]
+provider   = "qwen"
+reasoning  = "off"
+max_tokens = 512
+retries    = 2
+[[routes.fast.steps]]
+provider   = "upstage"
+model      = "solar-mini4"
+reasoning  = "off"
+max_tokens = 512
+retries    = 1
+
+# 뉴스 심층 요약: solar-pro4(추론 끔, 2.2s, 품질 Qwen 추론급) → 막히면 Qwen 추론 켬(25s).
+[routes.news-deep]
+cache_ttl = "6h"
+[routes.news-deep.validate]
+min_chars    = 40
+must_contain = ["요약", "영향"]
+[[routes.news-deep.steps]]
+provider   = "upstage"
+reasoning  = "off"
+max_tokens = 1024
+retries    = 1
+max_retry_wait = "5s"
+[[routes.news-deep.steps]]
+provider   = "qwen"
+reasoning  = "on"
+max_tokens = 4096
+retries    = 1
+
+# 추론이 필요한 분석: Qwen 추론 → Upstage 추론 high.
+[routes.reason]
+[[routes.reason.steps]]
+provider   = "qwen"
+reasoning  = "on"
+retries    = 1
+[[routes.reason.steps]]
+provider   = "upstage"
+reasoning  = "high"
+retries    = 1

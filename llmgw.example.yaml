@@ -1,0 +1,49 @@
+# llmgw.example.toml 과 같은 내용의 YAML 판. 형식은 확장자로 고른다.
+server:
+  addr: 127.0.0.1:17902
+
+providers:
+  qwen:
+    base_url: http://localhost:8000/v1
+    api_key_env: VLLM_API_KEY
+    model: Qwen/Qwen3.8-27B-FP8
+    reasoning: chat_template
+    reasoning_min_tokens: 4096
+    max_concurrency: 12
+    max_queue: 64
+    queue_timeout: 60s
+    timeout: 180s
+    breaker_failures: 5
+    breaker_cooldown: 30s
+  upstage:
+    base_url: https://api.upstage.ai/v1
+    api_key_env: UPSTAGE_API_KEY
+    model: solar-pro4
+    reasoning: effort
+    reasoning_min_tokens: 4096
+    rpm: 50
+    max_concurrency: 8
+    max_queue: 16
+    queue_timeout: 15s
+    timeout: 60s
+    breaker_failures: 3
+    breaker_cooldown: 60s
+
+routes:
+  fast:
+    cache_ttl: 10m
+    steps:
+      - {provider: qwen, reasoning: "off", max_tokens: 512, retries: 2}
+      - {provider: upstage, model: solar-mini4, reasoning: "off", max_tokens: 512, retries: 1}
+  news-deep:
+    cache_ttl: 6h
+    validate:
+      min_chars: 40
+      must_contain: [요약, 영향]
+    steps:
+      - {provider: upstage, reasoning: "off", max_tokens: 1024, retries: 1, max_retry_wait: 5s}
+      - {provider: qwen, reasoning: "on", max_tokens: 4096, retries: 1}
+  reason:
+    steps:
+      - {provider: qwen, reasoning: "on", retries: 1}
+      - {provider: upstage, reasoning: high, retries: 1}
