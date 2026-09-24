@@ -1,9 +1,10 @@
 # llmgw 설정 예시 — 자체 호스팅 vLLM 1대 + 외부 API(Upstage) 1개를 묶는 샘플. 값은 예시다.
 # 키 값은 여기 쓰지 않는다. api_key_env 에 환경변수 이름만 적는다.
 
+log_path = "llmgw-requests.jsonl"   # 요청 1건당 JSONL 한 줄(본문 제외). 비우면 기록 안 함
+
 [server]
 addr = "127.0.0.1:17902"
-# api_key_env = "LLMGW_API_KEY"   # 설정하면 서버 호출에 Bearer 로 요구
 
 # ── 프로바이더 ─────────────────────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ base_url         = "http://localhost:8000/v1"
 api_key_env      = "VLLM_API_KEY"
 model            = "Qwen/Qwen3.8-27B-FP8"
 reasoning        = "chat_template"   # enable_thinking on/off
+json_schema      = true              # response_format json_schema 를 그대로 받는다
 reasoning_min_tokens = 4096          # 추론 시 생각에 1~3K 토큰을 쓰므로 본문이 잘리지 않게
 max_concurrency  = 12
 max_queue        = 64
@@ -28,6 +30,8 @@ base_url         = "https://api.upstage.ai/v1"
 api_key_env      = "UPSTAGE_API_KEY"
 model            = "solar-pro4"
 reasoning        = "effort"          # reasoning_effort 미지정 = 추론 안 함(0.6s급)
+json_schema      = false             # json_schema 요청은 json_object 로 낮춰 보낸다
+passthrough      = true              # /passthrough/upstage/... 로 문서 파싱 등 전용 API 도 중계
 reasoning_min_tokens = 4096
 rpm              = 50
 max_concurrency  = 8
@@ -83,3 +87,27 @@ retries    = 1
 provider   = "upstage"
 reasoning  = "high"
 retries    = 1
+
+# ── 클라이언트 ─────────────────────────────────────────────────────────────
+# 게이트웨이를 부르는 서비스마다 하나. Bearer 키로 식별하고, 라우트·한도·통계를 따로 둔다.
+# clients 를 하나도 정의하지 않으면 인증 없이 전부 연다(127.0.0.1 전용일 때만).
+
+# 사용자가 기다리는 실시간 앱: 한도 없이, 빠른 라우트만
+[clients.web-app]
+api_key_env = "LLMGW_KEY_WEB_APP"
+routes      = ["fast", "news-deep"]
+
+# 야간 배치: 몰려도 다른 클라이언트 몫을 남기도록 동시 4, 대기 32
+[clients.batch-worker]
+api_key_env     = "LLMGW_KEY_BATCH"
+routes          = ["fast", "news-deep"]
+max_concurrency = 4
+max_queue       = 32
+queue_timeout   = "5m"
+
+# 문서 위키 생성기: 추론 라우트 + Upstage 문서 파싱 중계 허용
+[clients.wiki-builder]
+api_key_env     = "LLMGW_KEY_WIKI"
+routes          = ["*"]
+passthrough     = ["upstage"]
+rpm             = 30

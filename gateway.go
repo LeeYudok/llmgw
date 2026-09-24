@@ -17,11 +17,15 @@ import (
 
 // Request 는 게이트웨이 호출 1건이다. Route 가 step 체인을 고른다.
 type Request struct {
+	Client      string    `json:"client,omitempty"` // 호출한 클라이언트 이름(설정의 clients). 비우면 제한 없음
 	Route       string    `json:"route"`
 	Messages    []Message `json:"messages"`
 	MaxTokens   int       `json:"max_tokens,omitempty"`  // 0 이면 step 값
 	Temperature *float64  `json:"temperature,omitempty"` // nil 이면 step 값
 	JSON        bool      `json:"json,omitempty"`        // JSON 객체 응답 강제 + 검증
+	// ResponseFormat 은 OpenAI response_format 을 그대로 받는다(json_object, json_schema 등).
+	// json_schema 를 지원하지 않는 provider 로 가면 json_object 로 낮춘다.
+	ResponseFormat json.RawMessage `json:"response_format,omitempty"`
 }
 
 // Response 는 최종 성공 응답과 거쳐온 시도 기록이다.
@@ -54,6 +58,13 @@ var ErrAllFailed = errors.New("모든 step 실패")
 // ErrUnknownRoute 는 설정에 없는 라우트를 부를 때 반환한다.
 var ErrUnknownRoute = errors.New("라우트 없음")
 
+// 클라이언트 단위 거절 사유.
+var (
+	ErrUnknownClient   = errors.New("알 수 없는 클라이언트")
+	ErrRouteNotAllowed = errors.New("허용되지 않은 라우트")
+	ErrClientLimited   = errors.New("클라이언트 한도 초과")
+)
+
 // ChainError 는 전 step 실패 시 시도 기록을 담는다.
 type ChainError struct{ Attempts []Attempt }
 
@@ -69,10 +80,13 @@ func (e *ChainError) Unwrap() error { return ErrAllFailed }
 
 // Gateway 는 설정을 들고 요청을 라우팅한다. 여러 고루틴에서 동시에 써도 된다.
 type Gateway struct {
-	cfg   *Config
-	gates map[string]*gate
-	keys  map[string]string
-	hc    *http.Client
+	cfg         *Config
+	gates       map[string]*gate // provider 별
+	clientGates map[string]*gate // client 별
+	clientStats map[string]*clientStats
+	keys        map[string]string
+	hc          *http.Client
+	log         *requestLog
 
 	mu       sync.Mutex
 	inflight map[string]*flight // 같은 요청 동시 호출 합치기
@@ -93,12 +107,27 @@ type cacheEntry struct {
 // New 는 설정으로 게이트웨이를 만든다. 키는 각 프로바이더의 api_key_env 환경변수에서 읽는다.
 func New(cfg *Config) (*Gateway, error) {
 	g := &Gateway{
-		cfg:      cfg,
-		gates:    map[string]*gate{},
-		keys:     map[string]string{},
-		hc:       &http.Client{},
-		inflight: map[string]*flight{},
-		cache:    map[string]cacheEntry{},
+		cfg:         cfg,
+		gates:       map[string]*gate{},
+		clientGates: map[string]*gate{},
+		clientStats: map[string]*clientStats{},
+		keys:        map[string]string{},
+		hc:          &http.Client{},
+		inflight:    map[string]*flight{},
+		cache:       map[string]cacheEntry{},
+	}
+	for name, c := range cfg.Clients {
+		g.clientGates[name] = newGate(&ProviderConfig{
+			RPM: c.RPM, MaxConcurrency: c.MaxConcurrency, MaxQueue: c.MaxQueue, QueueTimeout: c.QueueTimeout,
+		})
+		g.clientStats[name] = &clientStats{}
+	}
+	if cfg.LogPath != "" {
+		l, err := openRequestLog(cfg.LogPath)
+		if err != nil {
+			return nil, err
+		}
+		g.log = l
 	}
 	for name, p := range cfg.Providers {
 		g.gates[name] = newGate(p)
@@ -115,11 +144,36 @@ func New(cfg *Config) (*Gateway, error) {
 
 // Call 은 라우트의 step 을 위에서부터 시도해 첫 성공 응답을 돌려준다.
 // 같은 내용의 요청이 동시에 들어오면 한 번만 호출하고 결과를 나눠 쓴다(cache_ttl 이 있으면 그동안 재사용).
-func (g *Gateway) Call(ctx context.Context, req Request) (*Response, error) {
+func (g *Gateway) Call(ctx context.Context, req Request) (resp *Response, err error) {
+	start := time.Now()
+	defer func() { g.record(req, resp, err, time.Since(start)) }()
+
 	route, ok := g.cfg.Routes[req.Route]
 	if !ok {
 		return nil, fmt.Errorf("%w: %q", ErrUnknownRoute, req.Route)
 	}
+	if req.Client != "" {
+		c, ok := g.cfg.Clients[req.Client]
+		if !ok {
+			return nil, fmt.Errorf("%w: %q", ErrUnknownClient, req.Client)
+		}
+		if !c.allows(req.Route) {
+			return nil, fmt.Errorf("%w: client %q → route %q", ErrRouteNotAllowed, req.Client, req.Route)
+		}
+		release, err := g.clientGates[req.Client].acquire(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, fmt.Errorf("%w: %s (%v)", ErrClientLimited, req.Client, err)
+		}
+		defer release()
+	}
+	return g.callRoute(ctx, route, req)
+}
+
+// callRoute 는 같은 요청 합치기·캐시를 거쳐 라우트를 실행한다.
+func (g *Gateway) callRoute(ctx context.Context, route *RouteConfig, req Request) (*Response, error) {
 	key := requestKey(req)
 
 	g.mu.Lock()
@@ -199,7 +253,11 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			a.LatencyMS = time.Since(t1).Milliseconds()
 
 			if err == nil {
-				if verr := validate(c.content, route.Validate, req.JSON); verr != nil {
+				verr := validate(c.content, route.Validate, wantsJSON(&req))
+				if verr == nil {
+					verr = checkSchema(c.content, schemaOf(req.ResponseFormat))
+				}
+				if verr != nil {
 					gt.report(false)
 					a.Error = "검증 실패: " + verr.Error()
 					attempts = append(attempts, a)
@@ -259,9 +317,7 @@ func validate(content string, v Validation, wantJSON bool) error {
 		return fmt.Errorf("%d자 미만", v.MinChars)
 	}
 	if v.RequireJSON || wantJSON {
-		s := strings.TrimSpace(content)
-		s = strings.TrimSuffix(strings.TrimPrefix(strings.TrimPrefix(s, "```json"), "```"), "```")
-		if !json.Valid([]byte(strings.TrimSpace(s))) {
+		if !json.Valid([]byte(stripFence(content))) {
 			return errors.New("JSON 아님")
 		}
 	}

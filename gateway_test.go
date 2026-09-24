@@ -320,6 +320,12 @@ func TestExampleConfigsLoad(t *testing.T) {
 			nd.CacheTTL.Duration != 6*time.Hour || c.Providers["upstage"].RPM != 50 {
 			t.Fatalf("%s 해석 이상: %+v", name, nd)
 		}
+		wb, bw := c.Clients["wiki-builder"], c.Clients["batch-worker"]
+		if wb == nil || bw == nil || len(wb.Passthrough) != 1 || wb.Passthrough[0] != "upstage" || wb.RPM != 30 ||
+			bw.QueueTimeout.Duration != 5*time.Minute || !c.Providers["qwen"].JSONSchema || !c.Providers["upstage"].Passthrough ||
+			c.LogPath == "" {
+			t.Fatalf("%s clients/provider 옵션 해석 이상", name)
+		}
 	}
 }
 

@@ -9,6 +9,10 @@ OpenAI 호환 엔드포인트 여러 개를 설정 파일(TOML 또는 YAML) 하�
   `queue_timeout`), 서킷 브레이커(`breaker_failures`, `breaker_cooldown`), 추론 전달 방식(`reasoning`)을 가진다.
 - **route**: 호출 이름. `steps` 를 위에서부터 시도한다. 순서를 바꾸면 우선순위가 바뀐다.
 - **step**: provider + 추론(`off|on|low|medium|high`) + `max_tokens` + `retries` + `max_retry_wait`.
+- **client**: 게이트웨이를 부르는 서비스 하나. 서버 모드에서 Bearer 키로 식별하고, 허용 라우트(`routes`)·
+  중계 허용 provider(`passthrough`)·자기 몫의 한도(`rpm`, `max_concurrency`, `max_queue`, `queue_timeout`)를 가진다.
+  여러 서비스가 같은 외부 API 키를 나눠 쓸 때 provider 한도는 게이트웨이 한 곳에서 지키고,
+  서비스별 한도로 한 서비스의 배치가 다른 서비스 몫까지 먹지 않게 한다.
 
 ## 호출이 몰릴 때
 
@@ -24,6 +28,45 @@ OpenAI 호환 엔드포인트 여러 개를 설정 파일(TOML 또는 YAML) 하�
 
 추론을 켠 step 은 `max_tokens` 를 provider 의 `reasoning_min_tokens`(기본 4096) 이상으로 올린다.
 추론 토큰과 본문 토큰이 한도를 공유해 본문이 빈 채로 잘리는 것을 막기 위해서다.
+
+## 여러 서비스가 같이 쓸 때 (clients)
+
+```toml
+[clients.batch-worker]
+api_key_env     = "LLMGW_KEY_BATCH"   # 이 서비스가 Bearer 로 보낼 키
+routes          = ["fast"]            # 허용 라우트("*" = 전부)
+max_concurrency = 4                   # 이 서비스의 동시 요청 수
+max_queue       = 32                  # 넘치면 즉시 429 (Retry-After: 5)
+```
+
+| 응답 | 의미 |
+|---|---|
+| 401 | 키 없음·틀림 |
+| 403 | 허용되지 않은 라우트 또는 passthrough |
+| 429 | 클라이언트 한도 초과 |
+| 502 | 모든 step 실패(`attempts` 에 시도 기록) |
+
+`/v1/models` 는 호출한 클라이언트가 쓸 수 있는 라우트만 보여준다. `/stats` 는 provider·client 별
+호출 수·성공·실패·거절·토큰·대기 중 요청 수를 돌려준다. `log_path` 를 주면 요청 1건당 JSONL 한 줄
+(클라이언트, 라우트, 처리 provider, 지연, 토큰, 에러)을 남긴다. 프롬프트·응답 본문은 남기지 않는다.
+
+## response_format
+
+호출자가 보낸 `response_format` 을 그대로 받는다. `json_schema`(strict 포함)는 provider 에
+`json_schema = true` 일 때만 그대로 보내고, 아니면 `json_object` 로 낮춰 보낸다. 어느 쪽이든 `json_*`
+형식을 요청했으면 응답이 JSON 인지 게이트웨이가 검증하고, 아니면 다음 step 으로 넘긴다.
+
+`json_object` 로 낮춰 보낼 때는 스키마를 system 지시문으로 요청 앞에 붙여 모델이 형식을 따르게 하고,
+응답이 스키마의 최상위 `required` 키와 `enum` 값을 지키는지 확인한다(전체 JSON Schema 검증기는 아니다).
+어기면 다음 step 으로 넘긴다.
+
+## passthrough — OpenAI 형식이 아닌 API
+
+provider 에 `passthrough = true` 를 주면 `/passthrough/<provider>/<path>` 로 들어온 요청을 그대로
+`<base_url>/<path>` 에 넘긴다(메서드·본문·쿼리·Content-Type 유지). 인증 헤더만 provider 키로 바꾸고,
+provider 의 분당 한도·동시 처리·대기열과 클라이언트 한도를 chat 호출과 똑같이 센다. 문서 파싱처럼
+같은 외부 키를 쓰는 전용 API 를 한도 관리 안에 넣을 때 쓴다. 클라이언트는 `passthrough` 목록에
+provider 가 있어야 한다.
 
 ## 추론 전달 방식 (`provider.reasoning`)
 

@@ -62,7 +62,12 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 		maxTokens = p.ReasoningMinTokens
 	}
 
-	body := map[string]any{"model": model, "messages": req.Messages, "max_tokens": maxTokens}
+	messages := req.Messages
+	if hint := schemaHint(p, req.ResponseFormat); hint != "" {
+		// json_schema 를 못 받는 provider: 스키마를 지시문으로 앞에 붙여 형식을 따르게 한다.
+		messages = append([]Message{{Role: "system", Content: hint}}, messages...)
+	}
+	body := map[string]any{"model": model, "messages": messages, "max_tokens": maxTokens}
 	maps.Copy(body, p.Extra)
 	switch {
 	case req.Temperature != nil:
@@ -70,8 +75,8 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 	case s.Temperature != nil:
 		body["temperature"] = *s.Temperature
 	}
-	if req.JSON {
-		body["response_format"] = map[string]string{"type": "json_object"}
+	if rf := responseFormatFor(p, &req.ResponseFormat, req.JSON); rf != nil {
+		body["response_format"] = rf
 	}
 
 	switch p.Reasoning {
@@ -92,6 +97,118 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 		}
 	}
 	return body
+}
+
+// responseFormatFor 는 호출자가 준 response_format 을 provider 능력에 맞춘다.
+// json_schema 를 지원하지 않는 provider 에는 json_object 로 낮춰 보낸다(응답은 게이트웨이가 JSON 인지 검증한다).
+func responseFormatFor(p *ProviderConfig, raw *json.RawMessage, wantJSON bool) any {
+	if raw == nil || len(*raw) == 0 || string(*raw) == "null" {
+		if wantJSON {
+			return map[string]string{"type": "json_object"}
+		}
+		return nil
+	}
+	var rf map[string]any
+	if err := json.Unmarshal(*raw, &rf); err != nil {
+		return nil
+	}
+	if rf["type"] == "json_schema" && !p.JSONSchema {
+		return map[string]string{"type": "json_object"}
+	}
+	return rf
+}
+
+// schemaOf 는 response_format 이 json_schema 일 때 그 스키마(raw)를 꺼낸다.
+func schemaOf(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var rf struct {
+		Type       string `json:"type"`
+		JSONSchema struct {
+			Schema json.RawMessage `json:"schema"`
+		} `json:"json_schema"`
+	}
+	if json.Unmarshal(raw, &rf) != nil || rf.Type != "json_schema" || len(rf.JSONSchema.Schema) == 0 {
+		return nil
+	}
+	return rf.JSONSchema.Schema
+}
+
+// schemaHint 는 json_schema 미지원 provider 에 붙일 지시문이다(지원하면 빈 문자열).
+func schemaHint(p *ProviderConfig, raw json.RawMessage) string {
+	s := schemaOf(raw)
+	if s == nil || p.JSONSchema {
+		return ""
+	}
+	return "Respond with a single JSON object that conforms exactly to this JSON Schema. " +
+		"Use only the listed property names and allowed enum values. No prose, no code fences.\n" + string(s)
+}
+
+// checkSchema 는 응답 JSON 이 스키마의 최상위 required 키와 enum 값을 지키는지 가볍게 확인한다.
+// 전체 JSON Schema 검증기는 아니다 — 낮춰 보낸 provider 가 형식을 흘렸는지 잡는 용도다.
+func checkSchema(content string, schema json.RawMessage) error {
+	if schema == nil {
+		return nil
+	}
+	var sc struct {
+		Required   []string `json:"required"`
+		Properties map[string]struct {
+			Enum []any `json:"enum"`
+		} `json:"properties"`
+	}
+	if json.Unmarshal(schema, &sc) != nil {
+		return nil
+	}
+	var obj map[string]any
+	if err := json.Unmarshal([]byte(stripFence(content)), &obj); err != nil {
+		return fmt.Errorf("JSON 객체 아님")
+	}
+	for _, k := range sc.Required {
+		if _, ok := obj[k]; !ok {
+			return fmt.Errorf("필수 키 %q 없음", k)
+		}
+	}
+	for k, prop := range sc.Properties {
+		v, ok := obj[k]
+		if !ok || len(prop.Enum) == 0 {
+			continue
+		}
+		found := false
+		for _, e := range prop.Enum {
+			if fmt.Sprint(e) == fmt.Sprint(v) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%q 값 %v 가 enum 밖", k, v)
+		}
+	}
+	return nil
+}
+
+// stripFence 는 ```json … ``` 코드펜스를 벗긴다.
+func stripFence(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "```json")
+	s = strings.TrimPrefix(s, "```")
+	s = strings.TrimSuffix(s, "```")
+	return strings.TrimSpace(s)
+}
+
+// wantsJSON 은 응답을 JSON 으로 검증해야 하는지다.
+func wantsJSON(req *Request) bool {
+	if req.JSON {
+		return true
+	}
+	var rf struct {
+		Type string `json:"type"`
+	}
+	if len(req.ResponseFormat) > 0 && json.Unmarshal(req.ResponseFormat, &rf) == nil {
+		return strings.HasPrefix(rf.Type, "json")
+	}
+	return false
 }
 
 // doCall 은 OpenAI 호환 /chat/completions 를 1회 호출한다.

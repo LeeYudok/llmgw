@@ -1,4 +1,5 @@
 # llmgw.example.toml 과 같은 내용의 YAML 판. 형식은 확장자로 고른다.
+log_path: llmgw-requests.jsonl
 server:
   addr: 127.0.0.1:17902
 
@@ -8,6 +9,7 @@ providers:
     api_key_env: VLLM_API_KEY
     model: Qwen/Qwen3.8-27B-FP8
     reasoning: chat_template
+    json_schema: true
     reasoning_min_tokens: 4096
     max_concurrency: 12
     max_queue: 64
@@ -20,6 +22,8 @@ providers:
     api_key_env: UPSTAGE_API_KEY
     model: solar-pro4
     reasoning: effort
+    json_schema: false
+    passthrough: true
     reasoning_min_tokens: 4096
     rpm: 50
     max_concurrency: 8
@@ -47,3 +51,19 @@ routes:
     steps:
       - {provider: qwen, reasoning: "on", retries: 1}
       - {provider: upstage, reasoning: high, retries: 1}
+
+clients:
+  web-app:
+    api_key_env: LLMGW_KEY_WEB_APP
+    routes: [fast, news-deep]
+  batch-worker:
+    api_key_env: LLMGW_KEY_BATCH
+    routes: [fast, news-deep]
+    max_concurrency: 4
+    max_queue: 32
+    queue_timeout: 5m
+  wiki-builder:
+    api_key_env: LLMGW_KEY_WIKI
+    routes: ["*"]
+    passthrough: [upstage]
+    rpm: 30

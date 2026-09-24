@@ -1,9 +1,11 @@
 package llmgw
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -13,53 +15,78 @@ import (
 
 // Handler 는 OpenAI 호환 HTTP 핸들러다. 요청의 model 에 라우트 이름을 넣으면 그 체인으로 호출한다.
 //
-//	POST /v1/chat/completions  {"model":"news-deep","messages":[...]}
-//	GET  /v1/models            라우트 목록
-//	GET  /stats                프로바이더별 호출·대기열 상태
+//	POST /v1/chat/completions              {"model":"<route>","messages":[...]}
+//	GET  /v1/models                        호출자가 쓸 수 있는 라우트 목록
+//	ANY  /passthrough/{provider}/{path...} provider API 그대로 중계(키·한도·대기열은 게이트웨이가 적용)
+//	GET  /stats                            provider·client 별 상태
 //	GET  /healthz
+//
+// clients 가 설정돼 있으면 Authorization: Bearer <client key> 로 호출자를 식별하고,
+// 없으면 인증 없이 모든 라우트를 연다(127.0.0.1 바인드 전제).
 func (g *Gateway) Handler() http.Handler {
-	token := ""
-	if env := g.cfg.Server.APIKeyEnv; env != "" {
-		token = os.Getenv(env)
-	}
+	auth := newAuthenticator(g.cfg.Clients)
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
-	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, http.StatusOK, g.Stats()) })
-	mux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /stats", auth.wrap(func(w http.ResponseWriter, _ *http.Request, _ string) {
+		writeJSON(w, http.StatusOK, map[string]any{"providers": g.Stats(), "clients": g.ClientStats()})
+	}))
+	mux.HandleFunc("GET /v1/models", auth.wrap(func(w http.ResponseWriter, _ *http.Request, client string) {
 		names := g.Routes()
 		sort.Strings(names)
 		data := make([]map[string]any, 0, len(names))
 		for _, n := range names {
+			if c := g.cfg.Clients[client]; c != nil && !c.allows(n) {
+				continue
+			}
 			data = append(data, map[string]any{"id": n, "object": "model", "owned_by": "llmgw"})
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
-	})
-	mux.HandleFunc("POST /v1/chat/completions", g.handleChat)
-	if token == "" {
-		return mux
+	}))
+	mux.HandleFunc("POST /v1/chat/completions", auth.wrap(g.handleChat))
+	mux.HandleFunc("/passthrough/{provider}/{path...}", auth.wrap(g.handlePassthrough))
+	return mux
+}
+
+// authenticator 는 Bearer 키를 클라이언트 이름으로 바꾼다.
+type authenticator struct {
+	keys map[string]string // client → key
+}
+
+func newAuthenticator(clients map[string]*ClientConfig) *authenticator {
+	a := &authenticator{keys: map[string]string{}}
+	for name, c := range clients {
+		if k := os.Getenv(c.APIKeyEnv); k != "" {
+			a.keys[name] = k
+		}
 	}
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" {
-			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
-				writeErr(w, http.StatusUnauthorized, "unauthorized")
+	return a
+}
+
+func (a *authenticator) wrap(h func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if len(a.keys) == 0 {
+			h(w, r, "")
+			return
+		}
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		for name, k := range a.keys {
+			if subtle.ConstantTimeCompare([]byte(got), []byte(k)) == 1 {
+				h(w, r, name)
 				return
 			}
 		}
-		mux.ServeHTTP(w, r)
-	})
+		writeErr(w, http.StatusUnauthorized, "unauthorized")
+	}
 }
 
-func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client string) {
 	var in struct {
-		Model          string    `json:"model"`
-		Messages       []Message `json:"messages"`
-		MaxTokens      int       `json:"max_tokens"`
-		Temperature    *float64  `json:"temperature"`
-		Stream         bool      `json:"stream"`
-		ResponseFormat *struct {
-			Type string `json:"type"`
-		} `json:"response_format"`
+		Model          string          `json:"model"`
+		Messages       []Message       `json:"messages"`
+		MaxTokens      int             `json:"max_tokens"`
+		Temperature    *float64        `json:"temperature"`
+		Stream         bool            `json:"stream"`
+		ResponseFormat json.RawMessage `json:"response_format"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&in); err != nil {
 		writeErr(w, http.StatusBadRequest, "요청 JSON: "+err.Error())
@@ -70,8 +97,8 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req := Request{
-		Route: in.Model, Messages: in.Messages, MaxTokens: in.MaxTokens, Temperature: in.Temperature,
-		JSON: in.ResponseFormat != nil && strings.HasPrefix(in.ResponseFormat.Type, "json"),
+		Client: client, Route: in.Model, Messages: in.Messages, MaxTokens: in.MaxTokens,
+		Temperature: in.Temperature, ResponseFormat: in.ResponseFormat,
 	}
 	resp, err := g.Call(r.Context(), req)
 	if err != nil {
@@ -83,6 +110,11 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 			})
 		case errors.Is(err, ErrUnknownRoute):
 			writeErr(w, http.StatusNotFound, err.Error())
+		case errors.Is(err, ErrRouteNotAllowed):
+			writeErr(w, http.StatusForbidden, err.Error())
+		case errors.Is(err, ErrClientLimited):
+			w.Header().Set("Retry-After", "5")
+			writeErr(w, http.StatusTooManyRequests, err.Error())
 		default:
 			writeErr(w, http.StatusGatewayTimeout, err.Error())
 		}
@@ -104,6 +136,77 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request) {
 		},
 		"llmgw": map[string]any{"route": in.Model, "provider": resp.Provider, "cached": resp.Cached, "attempts": resp.Attempts},
 	})
+}
+
+// handlePassthrough 는 provider API 를 그대로 중계한다. 인증 헤더만 provider 키로 바꾸고,
+// provider 의 한도·동시 처리·대기열과 클라이언트 한도를 똑같이 적용한다.
+func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, client string) {
+	name := r.PathValue("provider")
+	p, ok := g.cfg.Providers[name]
+	if !ok || !p.Passthrough {
+		writeErr(w, http.StatusNotFound, "passthrough provider 없음: "+name)
+		return
+	}
+	if c := g.cfg.Clients[client]; c != nil && !c.allowsPassthrough(name) {
+		writeErr(w, http.StatusForbidden, "허용되지 않은 passthrough: "+name)
+		return
+	}
+	if cg := g.clientGates[client]; cg != nil {
+		release, err := cg.acquire(r.Context())
+		if err != nil {
+			w.Header().Set("Retry-After", "5")
+			writeErr(w, http.StatusTooManyRequests, "클라이언트 한도 초과: "+err.Error())
+			return
+		}
+		defer release()
+	}
+	gt := g.gates[name]
+	release, err := gt.acquire(r.Context())
+	if err != nil {
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusTooManyRequests, "provider 대기열: "+err.Error())
+		return
+	}
+	defer release()
+
+	target := p.BaseURL + "/" + r.PathValue("path")
+	if r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), p.Timeout.Duration)
+	defer cancel()
+	out, err := http.NewRequestWithContext(ctx, r.Method, target, http.MaxBytesReader(w, r.Body, 128<<20))
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	for _, h := range []string{"Content-Type", "Accept", "Content-Encoding"} {
+		if v := r.Header.Get(h); v != "" {
+			out.Header.Set(h, v)
+		}
+	}
+	out.ContentLength = r.ContentLength
+	if k := g.keys[name]; k != "" {
+		out.Header.Set("Authorization", "Bearer "+k)
+	}
+	resp, err := g.hc.Do(out)
+	if err != nil {
+		gt.report(false)
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	gt.report(resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests)
+	if ra := parseRetryAfter(resp.Header.Get("Retry-After")); resp.StatusCode == http.StatusTooManyRequests && ra > 0 {
+		gt.deferRate(time.Now().Add(ra))
+	}
+	for _, h := range []string{"Content-Type", "Retry-After"} {
+		if v := resp.Header.Get(h); v != "" {
+			w.Header().Set(h, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, resp.Body)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

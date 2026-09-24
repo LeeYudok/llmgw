@@ -21,7 +21,11 @@ import (
 type Config struct {
 	Providers map[string]*ProviderConfig `toml:"providers" yaml:"providers"`
 	Routes    map[string]*RouteConfig    `toml:"routes" yaml:"routes"`
+	Clients   map[string]*ClientConfig   `toml:"clients" yaml:"clients"`
 	Server    ServerConfig               `toml:"server" yaml:"server"`
+	// LogPath 에 요청 1건당 JSONL 한 줄(클라이언트·라우트·처리 provider·지연·토큰·에러)을 남긴다.
+	// 프롬프트·응답 본문은 남기지 않는다. 비우면 기록하지 않는다.
+	LogPath string `toml:"log_path" yaml:"log_path"`
 }
 
 // ProviderConfig 는 OpenAI 호환 엔드포인트 하나와 그 트래픽 제어값이다.
@@ -49,7 +53,47 @@ type ProviderConfig struct {
 	BreakerFailures int      `toml:"breaker_failures" yaml:"breaker_failures"`
 	BreakerCooldown Duration `toml:"breaker_cooldown" yaml:"breaker_cooldown"`
 
+	// JSONSchema — response_format.type=json_schema 를 지원하는가. false 면 json_object 로 낮춰 보낸다.
+	JSONSchema bool `toml:"json_schema" yaml:"json_schema"`
+	// Passthrough — true 면 서버의 /passthrough/<provider>/<path> 로 OpenAI 형식이 아닌 API 도
+	// 이 provider 의 키·한도·대기열을 거쳐 그대로 중계한다(예: 문서 파싱 API).
+	Passthrough bool `toml:"passthrough" yaml:"passthrough"`
+
 	Extra map[string]any `toml:"extra" yaml:"extra"` // 요청 body 에 그대로 합칠 추가 필드
+}
+
+// ClientConfig 는 게이트웨이를 호출하는 쪽(서비스·앱) 하나다. 서버 모드에서 Bearer 키로 식별한다.
+// clients 를 하나도 정의하지 않으면 서버는 인증 없이 모든 라우트를 연다(로컬 전용 운용).
+type ClientConfig struct {
+	APIKeyEnv      string   `toml:"api_key_env" yaml:"api_key_env"`         // 이 클라이언트가 쓸 키를 담은 환경변수 이름
+	Routes         []string `toml:"routes" yaml:"routes"`                   // 허용 라우트. 비우거나 "*" 면 전부
+	Passthrough    []string `toml:"passthrough" yaml:"passthrough"`         // 중계를 허용할 provider 이름
+	RPM            int      `toml:"rpm" yaml:"rpm"`                         // 이 클라이언트의 분당 요청 한도(0 = 무제한)
+	MaxConcurrency int      `toml:"max_concurrency" yaml:"max_concurrency"` // 동시 요청 수(0 = 무제한)
+	MaxQueue       int      `toml:"max_queue" yaml:"max_queue"`             // 넘치면 즉시 429
+	QueueTimeout   Duration `toml:"queue_timeout" yaml:"queue_timeout"`
+}
+
+// allows 는 라우트 허용 여부다.
+func (c *ClientConfig) allows(route string) bool {
+	if len(c.Routes) == 0 {
+		return true
+	}
+	for _, r := range c.Routes {
+		if r == "*" || r == route {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ClientConfig) allowsPassthrough(provider string) bool {
+	for _, p := range c.Passthrough {
+		if p == "*" || p == provider {
+			return true
+		}
+	}
+	return false
 }
 
 // RouteConfig 는 호출 이름 하나(예: news-deep)의 step 체인과 공통 규칙이다.
@@ -79,8 +123,7 @@ type Validation struct {
 
 // ServerConfig 는 OpenAI 호환 HTTP 서버 모드 설정이다.
 type ServerConfig struct {
-	Addr      string `toml:"addr" yaml:"addr"`               // 기본 127.0.0.1:17902
-	APIKeyEnv string `toml:"api_key_env" yaml:"api_key_env"` // 설정하면 이 값을 Bearer 로 요구한다
+	Addr string `toml:"addr" yaml:"addr"` // 기본 127.0.0.1:17902
 }
 
 // Duration 은 "30s", "2m" 같은 문자열을 받는 time.Duration 이다.
@@ -145,6 +188,11 @@ func (c *Config) applyDefaults() {
 			p.BreakerCooldown.Duration = 30 * time.Second
 		}
 	}
+	for _, cl := range c.Clients {
+		if cl.QueueTimeout.Duration == 0 {
+			cl.QueueTimeout.Duration = 60 * time.Second
+		}
+	}
 	for _, r := range c.Routes {
 		for i := range r.Steps {
 			s := &r.Steps[i]
@@ -193,6 +241,22 @@ func (c *Config) validate() error {
 			case "off", "on", "low", "medium", "high":
 			default:
 				errs = append(errs, fmt.Errorf("route %s step %d: reasoning %q (off|on|low|medium|high)", name, i, s.Reasoning))
+			}
+		}
+	}
+	for name, cl := range c.Clients {
+		if cl.APIKeyEnv == "" {
+			errs = append(errs, fmt.Errorf("client %s: api_key_env 없음", name))
+		}
+		for _, r := range cl.Routes {
+			if _, ok := c.Routes[r]; !ok && r != "*" {
+				errs = append(errs, fmt.Errorf("client %s: route %q 없음", name, r))
+			}
+		}
+		for _, p := range cl.Passthrough {
+			pc, ok := c.Providers[p]
+			if p != "*" && (!ok || !pc.Passthrough) {
+				errs = append(errs, fmt.Errorf("client %s: passthrough provider %q 가 없거나 passthrough=false", name, p))
 			}
 		}
 	}
