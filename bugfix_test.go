@@ -263,7 +263,7 @@ func TestProbeReleasedOnAcquireFailure(t *testing.T) {
 	g := newGate(&ProviderConfig{BreakerFailures: 1, BreakerCooldown: Duration{time.Minute}, QueueTimeout: Duration{50 * time.Millisecond}})
 	g.mu.Lock()
 	g.tripped, g.openUntil = true, time.Now().Add(-time.Second) // 쿨다운이 끝나 half-open
-	g.next = time.Now().Add(time.Second)                         // Retry-After 로 1초 밀림 → 50ms 대기 안에 못 나감
+	g.next = time.Now().Add(time.Second)                        // Retry-After 로 1초 밀림 → 50ms 대기 안에 못 나감
 	g.mu.Unlock()
 	if _, err := g.acquireWithin(context.Background(), 0); err == nil {
 		t.Fatal("대기 마감 안에 자리가 없어 실패해야 함")
