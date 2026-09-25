@@ -420,3 +420,79 @@ func TestNormalizeReasoning(t *testing.T) {
 		}
 	}
 }
+
+func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { time.Sleep(150 * time.Millisecond); okJSON(w, "공유") })
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(f.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() { _, err := g.Call(leaderCtx, userReq("r", "같은 요청")); leaderErr <- err }()
+	time.Sleep(30 * time.Millisecond)
+	follower := make(chan *Response, 1)
+	go func() { r, _ := g.Call(context.Background(), userReq("r", "같은 요청")); follower <- r }()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("먼저 온 호출자는 자기 취소 에러를 받아야 함: %v", err)
+	}
+	if r := <-follower; r == nil || r.Content != "공유" || !r.Cached {
+		t.Fatalf("뒤에 붙은 호출자는 먼저 온 호출자 취소와 무관하게 결과를 받아야 함: %+v", r)
+	}
+	if f.calls.Load() != 1 {
+		t.Fatalf("upstream 1회여야 함: %d", f.calls.Load())
+	}
+}
+
+func TestSingleflightCancelledWhenAllWaitersLeave(t *testing.T) {
+	aborted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body) // 본문을 다 읽어야 서버가 클라이언트 연결 끊김을 감지한다
+		select {
+		case <-r.Context().Done():
+			close(aborted)
+		case <-time.After(2 * time.Second):
+			okJSON(w, "늦음")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() { g.Call(ctx, userReq("r", "모두 떠남")) })
+	}
+	wg.Wait()
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("대기자가 모두 떠나면 upstream 호출도 취소돼야 함")
+	}
+	g.mu.Lock()
+	n := len(g.inflight)
+	g.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("취소된 flight 가 남아 있음: %d", n)
+	}
+}
+
+func TestCacheBounded(t *testing.T) {
+	g := &Gateway{cache: map[string]cacheEntry{}}
+	g.mu.Lock()
+	for i := range maxCacheEntries + 100 {
+		g.putCache(fmt.Sprint(i), &Response{Content: fmt.Sprint(i)}, time.Hour)
+	}
+	_, newest := g.cache[fmt.Sprint(maxCacheEntries+99)]
+	_, oldest := g.cache["0"]
+	n := len(g.cache)
+	g.mu.Unlock()
+	if n != maxCacheEntries || !newest || oldest {
+		t.Fatalf("캐시 %d개(상한 %d), newest=%v oldest=%v — 오래된 항목부터 버려야 함", n, maxCacheEntries, newest, oldest)
+	}
+}
