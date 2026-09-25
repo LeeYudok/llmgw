@@ -1,0 +1,83 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 832 282" width="832" height="282" role="img" aria-label="요청은 브레이커, 대기열, 동시 처리 슬롯, 분당 한도를 차례로 지나야 호출된다. 브레이커가 열려 있거나 대기열이 가득 차면 바로 다음 step으로, 대기 시간을 넘기면 다음 step으로 넘어간다.">
+<style>
+svg{--card:#FFFFFF;--ink:#1B2330;--muted:#5A6577;--line:#C6CDD8;--ok:#0F766E;--ok-soft:#E3F3F1;--rej:#B23B34;--rej-soft:#FBECEA;--spill:#A8650A;--spill-soft:#FBF1E1;}
+@media (prefers-color-scheme: dark){svg{--card:#19202A;--ink:#E4E8EF;--muted:#98A2B3;--line:#333D4C;--ok:#3CB9AD;--ok-soft:#13302D;--rej:#E57A70;--rej-soft:#3A1F1D;--spill:#E3A34A;--spill-soft:#3A2C17;}}
+.bg{fill:var(--card)}
+text{font-family:"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",system-ui,sans-serif}
+text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; }
+.n { fill: var(--card); stroke: var(--line); stroke-width: 1.2; }
+.n-ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1.2; }
+.n-rej { fill: var(--rej-soft); stroke: var(--rej); stroke-width: 1.2; }
+.n-spill { fill: var(--spill-soft); stroke: var(--spill); stroke-width: 1.2; }
+.frame { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.t { fill: var(--ink); font-size: 14px; font-weight: 600; }
+.s { fill: var(--muted); font-size: 12px; }
+.m { font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; }
+.lbl { fill: var(--muted); font-size: 11.5px; }
+.lbl-rej { fill: var(--rej); font-size: 11.5px; font-weight: 500; }
+.lbl-ok { fill: var(--ok); font-size: 11.5px; font-weight: 500; }
+.lbl-spill { fill: var(--spill); font-size: 11.5px; font-weight: 500; }
+.tc-rej { fill: var(--rej); font-size: 13px; font-weight: 600; }
+.tc-ok { fill: var(--ok); font-size: 13px; font-weight: 600; }
+.tc-spill { fill: var(--spill); font-size: 14px; font-weight: 600; }
+.e { stroke: var(--ink); stroke-width: 1.4; fill: none; }
+.e-rej { stroke: var(--rej); stroke-width: 1.4; fill: none; }
+.e-ok { stroke: var(--ok); stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+.e-spill { stroke: var(--spill); stroke-width: 1.4; fill: none; }
+.e-retry { stroke: var(--ink); stroke-width: 1.4; fill: none; stroke-dasharray: 4 3; }
+.ah-ink { fill: var(--ink); }
+.ah-rej { fill: var(--rej); }
+.ah-ok { fill: var(--ok); }
+.ah-spill { fill: var(--spill); }
+
+
+</style>
+<rect class="bg" x="0" y="0" width="832" height="282" rx="10"/>
+<g transform="translate(16 16)">
+          <defs>
+            <marker id="f3-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-ink"/></marker>
+            <marker id="f3-spill" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-spill"/></marker>
+          </defs>
+
+          <!-- 대기 구간 괄호 -->
+          <path class="e" d="M260,44 V36 H690 V44" style="stroke:var(--muted)"/>
+          <text class="lbl" x="475" y="26" text-anchor="middle">여기서 기다리는 시간 ≤ queue_timeout (max_wait 가 더 짧으면 그 값)</text>
+
+          <rect class="n" x="10" y="64" width="70" height="60" rx="8"/>
+          <text class="t" x="45" y="99" text-anchor="middle">요청</text>
+          <line class="e" x1="80" y1="94" x2="108" y2="94" marker-end="url(#f3-ink)"/>
+
+          <rect class="n" x="110" y="64" width="120" height="60" rx="8"/>
+          <text class="t" x="170" y="90" text-anchor="middle">브레이커</text>
+          <text class="s" x="170" y="109" text-anchor="middle">연속 실패 감시</text>
+          <line class="e" x1="230" y1="94" x2="258" y2="94" marker-end="url(#f3-ink)"/>
+
+          <rect class="n" x="260" y="64" width="120" height="60" rx="8"/>
+          <text class="t" x="320" y="90" text-anchor="middle">대기열</text>
+          <text class="s m" x="320" y="109" text-anchor="middle">max_queue</text>
+          <line class="e" x1="380" y1="94" x2="408" y2="94" marker-end="url(#f3-ink)"/>
+
+          <rect class="n" x="410" y="64" width="140" height="60" rx="8"/>
+          <text class="t" x="480" y="90" text-anchor="middle">동시 처리 슬롯</text>
+          <text class="s m" x="480" y="109" text-anchor="middle">max_concurrency</text>
+          <line class="e" x1="550" y1="94" x2="568" y2="94" marker-end="url(#f3-ink)"/>
+
+          <rect class="n" x="570" y="64" width="120" height="60" rx="8"/>
+          <text class="t" x="630" y="90" text-anchor="middle">분당 한도</text>
+          <text class="s m" x="630" y="109" text-anchor="middle">간격 1분/rpm</text>
+          <line class="e" x1="690" y1="94" x2="718" y2="94" marker-end="url(#f3-ink)"/>
+
+          <rect class="n-ok" x="720" y="64" width="70" height="60" rx="8"/>
+          <text class="tc-ok" x="755" y="99" text-anchor="middle">호출</text>
+
+          <!-- 넘김 -->
+          <line class="e-spill" x1="170" y1="124" x2="170" y2="178" marker-end="url(#f3-spill)"/>
+          <text class="lbl-spill" x="170" y="198" text-anchor="middle">열려 있음</text>
+          <line class="e-spill" x1="320" y1="124" x2="320" y2="178" marker-end="url(#f3-spill)"/>
+          <text class="lbl-spill" x="320" y="198" text-anchor="middle">가득 참</text>
+          <path class="e-spill" d="M480,124 V150 H630 V124" />
+          <line class="e-spill" x1="555" y1="150" x2="555" y2="178" marker-end="url(#f3-spill)"/>
+          <text class="lbl-spill" x="555" y="198" text-anchor="middle">대기 시간 초과</text>
+          <text class="s" x="400" y="232" text-anchor="middle">세 경우 모두 재시도 없이 다음 step 으로. 429 의 Retry-After 는 분당 한도 시각을 뒤로 밀어 다른 요청도 같이 늦춥니다.</text>
+        </g>
+</svg>

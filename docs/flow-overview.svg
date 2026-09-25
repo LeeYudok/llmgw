@@ -1,0 +1,124 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 792 822" width="792" height="822" role="img" aria-label="요청은 인증, 라우트·권한 확인, client 게이트, 캐시·중복 합치기, step 체인, 기록을 거쳐 응답이 된다. 각 단계에서 401, 404·403, 429, 502로 빠질 수 있고, 캐시에 있으면 체인을 건너뛰고 바로 응답한다.">
+<style>
+svg{--card:#FFFFFF;--ink:#1B2330;--muted:#5A6577;--line:#C6CDD8;--ok:#0F766E;--ok-soft:#E3F3F1;--rej:#B23B34;--rej-soft:#FBECEA;--spill:#A8650A;--spill-soft:#FBF1E1;}
+@media (prefers-color-scheme: dark){svg{--card:#19202A;--ink:#E4E8EF;--muted:#98A2B3;--line:#333D4C;--ok:#3CB9AD;--ok-soft:#13302D;--rej:#E57A70;--rej-soft:#3A1F1D;--spill:#E3A34A;--spill-soft:#3A2C17;}}
+.bg{fill:var(--card)}
+text{font-family:"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",system-ui,sans-serif}
+text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; }
+.n { fill: var(--card); stroke: var(--line); stroke-width: 1.2; }
+.n-ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1.2; }
+.n-rej { fill: var(--rej-soft); stroke: var(--rej); stroke-width: 1.2; }
+.n-spill { fill: var(--spill-soft); stroke: var(--spill); stroke-width: 1.2; }
+.frame { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.t { fill: var(--ink); font-size: 14px; font-weight: 600; }
+.s { fill: var(--muted); font-size: 12px; }
+.m { font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; }
+.lbl { fill: var(--muted); font-size: 11.5px; }
+.lbl-rej { fill: var(--rej); font-size: 11.5px; font-weight: 500; }
+.lbl-ok { fill: var(--ok); font-size: 11.5px; font-weight: 500; }
+.lbl-spill { fill: var(--spill); font-size: 11.5px; font-weight: 500; }
+.tc-rej { fill: var(--rej); font-size: 13px; font-weight: 600; }
+.tc-ok { fill: var(--ok); font-size: 13px; font-weight: 600; }
+.tc-spill { fill: var(--spill); font-size: 14px; font-weight: 600; }
+.e { stroke: var(--ink); stroke-width: 1.4; fill: none; }
+.e-rej { stroke: var(--rej); stroke-width: 1.4; fill: none; }
+.e-ok { stroke: var(--ok); stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+.e-spill { stroke: var(--spill); stroke-width: 1.4; fill: none; }
+.e-retry { stroke: var(--ink); stroke-width: 1.4; fill: none; stroke-dasharray: 4 3; }
+.ah-ink { fill: var(--ink); }
+.ah-rej { fill: var(--rej); }
+.ah-ok { fill: var(--ok); }
+.ah-spill { fill: var(--spill); }
+
+
+</style>
+<rect class="bg" x="0" y="0" width="792" height="822" rx="10"/>
+<g transform="translate(16 16)">
+          <defs>
+            <marker id="f1-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-ink"/></marker>
+            <marker id="f1-rej" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-rej"/></marker>
+            <marker id="f1-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-ok"/></marker>
+            <marker id="f1-spill" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-spill"/></marker>
+          </defs>
+
+          <!-- 1 요청 -->
+          <rect class="n" x="40" y="20" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="43">요청</text>
+          <text class="s m" x="56" y="63">POST /v1/chat/completions · model = 라우트</text>
+          <line class="e" x1="220" y1="76" x2="220" y2="102" marker-end="url(#f1-ink)"/>
+
+          <!-- 2 인증 -->
+          <rect class="n" x="40" y="104" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="127">인증</text>
+          <text class="s" x="56" y="147">Bearer 키로 호출한 서비스(client)를 찾음</text>
+          <line class="e-rej" x1="400" y1="132" x2="468" y2="132" marker-end="url(#f1-rej)"/>
+          <text class="lbl-rej" x="408" y="124">키 없음</text>
+          <rect class="n-rej" x="470" y="110" width="250" height="44" rx="8"/>
+          <text class="tc-rej" x="486" y="137">401 인증 실패</text>
+          <line class="e" x1="220" y1="160" x2="220" y2="186" marker-end="url(#f1-ink)"/>
+
+          <!-- 3 라우트·권한 -->
+          <rect class="n" x="40" y="188" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="211">라우트·권한 확인</text>
+          <text class="s" x="56" y="231">허용 라우트 · allow_external · 추론 값 정리</text>
+          <line class="e-rej" x1="400" y1="216" x2="468" y2="216" marker-end="url(#f1-rej)"/>
+          <text class="lbl-rej" x="408" y="208">불가</text>
+          <rect class="n-rej" x="470" y="194" width="250" height="44" rx="8"/>
+          <text class="tc-rej" x="486" y="221">404 라우트 없음 · 403 금지</text>
+          <line class="e" x1="220" y1="244" x2="220" y2="270" marker-end="url(#f1-ink)"/>
+
+          <!-- 4 client 게이트 -->
+          <rect class="n" x="40" y="272" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="295">client 게이트</text>
+          <text class="s" x="56" y="315">서비스별 동시 처리 · 대기열 · 분당 한도</text>
+          <line class="e-rej" x1="400" y1="300" x2="468" y2="300" marker-end="url(#f1-rej)"/>
+          <text class="lbl-rej" x="408" y="292">넘침</text>
+          <rect class="n-rej" x="470" y="278" width="250" height="44" rx="8"/>
+          <text class="tc-rej" x="486" y="305">429 client 한도 초과</text>
+          <line class="e" x1="220" y1="328" x2="220" y2="354" marker-end="url(#f1-ink)"/>
+
+          <!-- 5 캐시·중복 합치기 -->
+          <rect class="n" x="40" y="356" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="379">캐시 · 같은 요청 합치기</text>
+          <text class="s m" x="56" y="399">key = sha256(요청)</text>
+          <line class="e-ok" x1="400" y1="384" x2="468" y2="384" marker-end="url(#f1-ok)"/>
+          <text class="lbl-ok" x="408" y="376">있음</text>
+          <rect class="n-ok" x="470" y="358" width="250" height="52" rx="8"/>
+          <text class="tc-ok" x="486" y="380">캐시 적중 → 바로 응답</text>
+          <text class="s" x="486" y="399">진행 중인 같은 요청은 결과 공유</text>
+          <path class="e-ok" d="M720,384 H744 V748 H402" marker-end="url(#f1-ok)"/>
+          <line class="e" x1="220" y1="412" x2="220" y2="438" marker-end="url(#f1-ink)"/>
+
+          <!-- 6 step 체인 -->
+          <rect class="frame" x="40" y="440" width="360" height="160" rx="10"/>
+          <text class="t" x="56" y="464">step 체인 — 위에서부터 차례로</text>
+          <rect class="n" x="56" y="484" width="128" height="48" rx="6"/>
+          <text class="t" x="70" y="505" style="font-size:13px">step 1</text>
+          <text class="s" x="70" y="522">예: upstage</text>
+          <line class="e-spill" x1="184" y1="508" x2="226" y2="508" marker-end="url(#f1-spill)"/>
+          <text class="lbl-spill" x="190" y="500">넘김</text>
+          <rect class="n" x="228" y="484" width="128" height="48" rx="6"/>
+          <text class="t" x="242" y="505" style="font-size:13px">step 2</text>
+          <text class="s" x="242" y="522">예: qwen</text>
+          <text class="t" x="366" y="513" style="font-size:16px">…</text>
+          <text class="s" x="56" y="560">처음 성공한 step 의 응답을 씀</text>
+          <text class="s" x="56" y="580">step 하나의 과정은 그림 2</text>
+          <line class="e-rej" x1="400" y1="520" x2="468" y2="520" marker-end="url(#f1-rej)"/>
+          <text class="lbl-rej" x="408" y="512">전부 실패</text>
+          <rect class="n-rej" x="470" y="492" width="250" height="56" rx="8"/>
+          <text class="tc-rej" x="486" y="516">502 모든 step 실패</text>
+          <text class="s" x="486" y="536">시도 기록은 분류만 담음</text>
+          <line class="e" x1="220" y1="600" x2="220" y2="634" marker-end="url(#f1-ink)"/>
+
+          <!-- 7 기록 -->
+          <rect class="n" x="40" y="636" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="659">저장 · 기록</text>
+          <text class="s" x="56" y="679">cache_ttl 캐시 · 통계 · 요청 로그(원문은 여기만)</text>
+          <line class="e" x1="220" y1="692" x2="220" y2="718" marker-end="url(#f1-ink)"/>
+
+          <!-- 8 응답 -->
+          <rect class="n-ok" x="40" y="720" width="360" height="56" rx="8"/>
+          <text class="t" x="56" y="743">응답</text>
+          <text class="s" x="56" y="763">JSON + llmgw 필드 · X-LLMGW-* 헤더</text>
+        </g>
+</svg>

@@ -1,0 +1,109 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 792 722" width="792" height="722" role="img" aria-label="step 하나는 body 만들기, 외부 차단 확인, 마스킹, spill 판단, provider 게이트, HTTP 호출, 응답 검증을 거친다. 차단, 더 빨리 끝남, 자리 없음, 재시도 소진이나 4xx, 검증 실패면 다음 step으로 넘어간다. 429·5xx·네트워크 오류는 게이트로 돌아가 재시도한다.">
+<style>
+svg{--card:#FFFFFF;--ink:#1B2330;--muted:#5A6577;--line:#C6CDD8;--ok:#0F766E;--ok-soft:#E3F3F1;--rej:#B23B34;--rej-soft:#FBECEA;--spill:#A8650A;--spill-soft:#FBF1E1;}
+@media (prefers-color-scheme: dark){svg{--card:#19202A;--ink:#E4E8EF;--muted:#98A2B3;--line:#333D4C;--ok:#3CB9AD;--ok-soft:#13302D;--rej:#E57A70;--rej-soft:#3A1F1D;--spill:#E3A34A;--spill-soft:#3A2C17;}}
+.bg{fill:var(--card)}
+text{font-family:"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",system-ui,sans-serif}
+text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif; }
+.n { fill: var(--card); stroke: var(--line); stroke-width: 1.2; }
+.n-ok { fill: var(--ok-soft); stroke: var(--ok); stroke-width: 1.2; }
+.n-rej { fill: var(--rej-soft); stroke: var(--rej); stroke-width: 1.2; }
+.n-spill { fill: var(--spill-soft); stroke: var(--spill); stroke-width: 1.2; }
+.frame { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 5 4; }
+.t { fill: var(--ink); font-size: 14px; font-weight: 600; }
+.s { fill: var(--muted); font-size: 12px; }
+.m { font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace; }
+.lbl { fill: var(--muted); font-size: 11.5px; }
+.lbl-rej { fill: var(--rej); font-size: 11.5px; font-weight: 500; }
+.lbl-ok { fill: var(--ok); font-size: 11.5px; font-weight: 500; }
+.lbl-spill { fill: var(--spill); font-size: 11.5px; font-weight: 500; }
+.tc-rej { fill: var(--rej); font-size: 13px; font-weight: 600; }
+.tc-ok { fill: var(--ok); font-size: 13px; font-weight: 600; }
+.tc-spill { fill: var(--spill); font-size: 14px; font-weight: 600; }
+.e { stroke: var(--ink); stroke-width: 1.4; fill: none; }
+.e-rej { stroke: var(--rej); stroke-width: 1.4; fill: none; }
+.e-ok { stroke: var(--ok); stroke-width: 1.4; fill: none; stroke-dasharray: 5 4; }
+.e-spill { stroke: var(--spill); stroke-width: 1.4; fill: none; }
+.e-retry { stroke: var(--ink); stroke-width: 1.4; fill: none; stroke-dasharray: 4 3; }
+.ah-ink { fill: var(--ink); }
+.ah-rej { fill: var(--rej); }
+.ah-ok { fill: var(--ok); }
+.ah-spill { fill: var(--spill); }
+
+
+</style>
+<rect class="bg" x="0" y="0" width="792" height="722" rx="10"/>
+<g transform="translate(16 16)">
+          <defs>
+            <marker id="f2-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-ink"/></marker>
+            <marker id="f2-spill" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="ah-spill"/></marker>
+          </defs>
+
+          <!-- 다음 step 기둥 -->
+          <rect class="n-spill" x="600" y="100" width="140" height="500" rx="10"/>
+          <text class="tc-spill" x="670" y="340" text-anchor="middle">다음 step</text>
+          <text class="s" x="670" y="362" text-anchor="middle">으로 넘김</text>
+
+          <!-- S1 -->
+          <rect class="n" x="60" y="20" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="43">body 만들기</text>
+          <text class="s" x="76" y="63">모델 · max_tokens · 추론 설정 · response_format</text>
+          <line class="e" x1="245" y1="76" x2="245" y2="98" marker-end="url(#f2-ink)"/>
+
+          <!-- S2 -->
+          <rect class="n" x="60" y="100" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="123">외부 차단 확인</text>
+          <text class="s" x="76" y="143">external provider 인데 외부 차단 요청이면</text>
+          <line class="e-spill" x1="430" y1="128" x2="598" y2="128" marker-end="url(#f2-spill)"/>
+          <text class="lbl-spill" x="442" y="120">차단</text>
+          <line class="e" x1="245" y1="156" x2="245" y2="178" marker-end="url(#f2-ink)"/>
+
+          <!-- S3 -->
+          <rect class="n" x="60" y="180" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="203">개인정보 마스킹</text>
+          <text class="s" x="76" y="223">external 이거나 mask=true 면 주민번호 등을 가림</text>
+          <line class="e" x1="245" y1="236" x2="245" y2="258" marker-end="url(#f2-ink)"/>
+
+          <!-- S4 -->
+          <rect class="n" x="60" y="260" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="283">spill = auto</text>
+          <text class="s" x="76" y="303">여기서 기다림 vs 다음 step, 예상 완료 비교</text>
+          <line class="e-spill" x1="430" y1="288" x2="598" y2="288" marker-end="url(#f2-spill)"/>
+          <text class="lbl-spill" x="442" y="280">다음이 더 빨리 끝남</text>
+          <line class="e" x1="245" y1="316" x2="245" y2="338" marker-end="url(#f2-ink)"/>
+
+          <!-- S5 -->
+          <rect class="n" x="60" y="340" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="363">provider 게이트</text>
+          <text class="s" x="76" y="383">브레이커 · 대기열 · 동시 처리 · 분당 한도 (그림 3)</text>
+          <line class="e-spill" x1="430" y1="368" x2="598" y2="368" marker-end="url(#f2-spill)"/>
+          <text class="lbl-spill" x="442" y="360">자리 못 얻음</text>
+          <line class="e" x1="245" y1="396" x2="245" y2="418" marker-end="url(#f2-ink)"/>
+
+          <!-- S6 -->
+          <rect class="n" x="60" y="420" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="443">HTTP 호출</text>
+          <text class="s" x="76" y="463">provider timeout 안에 응답을 받음</text>
+          <line class="e-spill" x1="430" y1="448" x2="598" y2="448" marker-end="url(#f2-spill)"/>
+          <text class="lbl-spill" x="442" y="440">4xx · 재시도 소진</text>
+          <!-- 재시도 고리 -->
+          <path class="e-retry" d="M60,448 H30 V368 H58" marker-end="url(#f2-ink)"/>
+          <text class="lbl" x="22" y="408" text-anchor="middle" transform="rotate(-90 22 408)">재시도</text>
+          <text class="lbl" x="76" y="496">429 · 5xx · 네트워크 → 재시도</text>
+          <line class="e" x1="245" y1="476" x2="245" y2="518" marker-end="url(#f2-ink)"/>
+          <text class="lbl" x="253" y="512">200</text>
+
+          <!-- S7 -->
+          <rect class="n" x="60" y="520" width="370" height="56" rx="8"/>
+          <text class="t" x="76" y="543">응답 검증</text>
+          <text class="s" x="76" y="563">빈 응답 · min_chars · JSON · must_contain · 스키마</text>
+          <line class="e-spill" x1="430" y1="548" x2="598" y2="548" marker-end="url(#f2-spill)"/>
+          <text class="lbl-spill" x="442" y="540">검증 실패</text>
+          <line class="e" x1="245" y1="576" x2="245" y2="610" marker-end="url(#f2-ink)"/>
+
+          <!-- S8 -->
+          <rect class="n-ok" x="60" y="612" width="370" height="56" rx="8"/>
+          <text class="tc-ok" x="76" y="636">성공</text>
+          <text class="s" x="76" y="656">이 응답을 돌려주고 체인을 끝냄</text>
+        </g>
+</svg>
