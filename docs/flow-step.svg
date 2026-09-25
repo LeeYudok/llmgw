@@ -30,7 +30,6 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
 .ah-ok { fill: var(--ok); }
 .ah-spill { fill: var(--spill); }
 
-
 </style>
 <rect class="bg" x="0" y="0" width="792" height="722" rx="10"/>
 <g transform="translate(16 16)">
@@ -61,7 +60,7 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
           <!-- S3 -->
           <rect class="n" x="60" y="180" width="370" height="56" rx="8"/>
           <text class="t" x="76" y="203">개인정보 마스킹</text>
-          <text class="s" x="76" y="223">external 이거나 mask=true 면 주민번호 등을 가림</text>
+          <text class="s" x="76" y="223">[mask] external=true 이고 external 이거나, mask=true 면</text>
           <line class="e" x1="245" y1="236" x2="245" y2="258" marker-end="url(#f2-ink)"/>
 
           <!-- S4 -->

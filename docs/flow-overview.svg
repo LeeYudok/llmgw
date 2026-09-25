@@ -30,7 +30,6 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
 .ah-ok { fill: var(--ok); }
 .ah-spill { fill: var(--spill); }
 
-
 </style>
 <rect class="bg" x="0" y="0" width="792" height="822" rx="10"/>
 <g transform="translate(16 16)">
@@ -60,7 +59,7 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
           <!-- 3 라우트·권한 -->
           <rect class="n" x="40" y="188" width="360" height="56" rx="8"/>
           <text class="t" x="56" y="211">라우트·권한 확인</text>
-          <text class="s" x="56" y="231">허용 라우트 · allow_external · 추론 값 정리</text>
+          <text class="s" x="56" y="231">허용 라우트 확인 · 추론 값 정리</text>
           <line class="e-rej" x1="400" y1="216" x2="468" y2="216" marker-end="url(#f1-rej)"/>
           <text class="lbl-rej" x="408" y="208">불가</text>
           <rect class="n-rej" x="470" y="194" width="250" height="44" rx="8"/>
@@ -80,7 +79,7 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
           <!-- 5 캐시·중복 합치기 -->
           <rect class="n" x="40" y="356" width="360" height="56" rx="8"/>
           <text class="t" x="56" y="379">캐시 · 같은 요청 합치기</text>
-          <text class="s m" x="56" y="399">key = sha256(요청)</text>
+          <text class="s" x="56" y="399">스트림이 아닌 요청만 · key = sha256(요청)</text>
           <line class="e-ok" x1="400" y1="384" x2="468" y2="384" marker-end="url(#f1-ok)"/>
           <text class="lbl-ok" x="408" y="376">있음</text>
           <rect class="n-ok" x="470" y="358" width="250" height="52" rx="8"/>
@@ -102,7 +101,7 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
           <text class="s" x="242" y="522">예: qwen</text>
           <text class="t" x="366" y="513" style="font-size:16px">…</text>
           <text class="s" x="56" y="560">처음 성공한 step 의 응답을 씀</text>
-          <text class="s" x="56" y="580">step 하나의 과정은 그림 2</text>
+          <text class="s" x="56" y="580">외부 차단(allow_external·헤더)은 그림 2 에서 판단</text>
           <line class="e-rej" x1="400" y1="520" x2="468" y2="520" marker-end="url(#f1-rej)"/>
           <text class="lbl-rej" x="408" y="512">전부 실패</text>
           <rect class="n-rej" x="470" y="492" width="250" height="56" rx="8"/>

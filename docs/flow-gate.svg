@@ -30,7 +30,6 @@ text { font-family: "IBM Plex Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", 
 .ah-ok { fill: var(--ok); }
 .ah-spill { fill: var(--spill); }
 
-
 </style>
 <rect class="bg" x="0" y="0" width="832" height="282" rx="10"/>
 <g transform="translate(16 16)">
