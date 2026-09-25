@@ -269,13 +269,13 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 		defer release()
 	}
 	gt := g.gates[name]
-	release, err := gt.acquire(r.Context())
+	pm, err := gt.acquireWithin(r.Context(), 0)
 	if err != nil {
 		w.Header().Set("Retry-After", "5")
 		writeErr(w, http.StatusTooManyRequests, "provider 대기열: "+err.Error())
 		return
 	}
-	defer release()
+	defer pm.release()
 
 	raw := strings.TrimPrefix(r.URL.EscapedPath(), "/passthrough/")
 	_, rawPath, _ := strings.Cut(raw, "/")
@@ -302,16 +302,16 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	resp, err := g.hc.Do(out)
 	if err != nil {
 		if r.Context().Err() != nil {
-			gt.reportNeutral() // 호출자가 끊은 것은 provider 실패가 아니다
+			pm.reportNeutral() // 호출자가 끊은 것은 provider 실패가 아니다
 		} else {
-			gt.report(false)
+			pm.report(false)
 		}
 		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 		writeErr(w, http.StatusBadGateway, transportError(err, timedOut, false).public()) // 내부 주소를 내보내지 않는다
 		return
 	}
 	defer resp.Body.Close()
-	gt.report(resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests)
+	pm.report(resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests)
 	if ra := parseRetryAfter(resp.Header.Get("Retry-After")); resp.StatusCode == http.StatusTooManyRequests && ra > 0 {
 		gt.deferRate(time.Now().Add(ra))
 	}

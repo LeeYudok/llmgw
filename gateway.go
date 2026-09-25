@@ -366,7 +366,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
+			pm, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -378,7 +378,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 			t1 := time.Now()
 			c, err := doCall(ctx, g.hc, p, g.keys[s.Provider], body)
-			release()
+			pm.release()
 			a.LatencyMS = time.Since(t1).Milliseconds()
 
 			if err == nil {
@@ -387,12 +387,12 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					verr = checkSchema(c.content, schemaOf(req.ResponseFormat))
 				}
 				if verr != nil {
-					gt.reportNeutral() // 요청 내용에 따라 갈리는 실패라 provider 전체를 막지 않는다
+					pm.reportNeutral() // 요청 내용에 따라 갈리는 실패라 provider 전체를 막지 않는다
 					a.Error = "검증 실패: " + verr.Error()
 					attempts = append(attempts, a)
 					break // 같은 설정으로 다시 불러도 같은 결과일 가능성이 커서 다음 step 으로
 				}
-				gt.report(true)
+				pm.report(true)
 				gt.lat.observe(time.Since(t1))
 				attempts = append(attempts, a)
 				if c.model == "" {
@@ -410,9 +410,9 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			var ce *callError
 			errors.As(err, &ce)
 			if ce != nil && !ce.providerFault() {
-				gt.reportNeutral()
+				pm.reportNeutral()
 			} else {
-				gt.report(false)
+				pm.report(false)
 			}
 			a.setError(err)
 			attempts = append(attempts, a)

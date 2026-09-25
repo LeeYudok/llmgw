@@ -108,17 +108,51 @@ func newGate(p *ProviderConfig) *gate {
 	return g
 }
 
+// permit 은 게이트를 통과한 요청 한 건의 자격이다. 호출이 끝나면 release 하고, 결과는 report 로 알린다.
+// probe 는 half-open 에서 시험 요청으로 들어온 요청인지다 — 그 결과만 브레이커를 닫거나 다시 연다.
+type permit struct {
+	g     *gate
+	probe bool
+	once  sync.Once
+}
+
+func (p *permit) release() {
+	p.once.Do(func() {
+		p.g.inFlight.Add(-1)
+		if p.g.slots != nil {
+			<-p.g.slots
+		}
+	})
+}
+
+func (p *permit) report(ok bool) { p.g.report(ok, p.probe) }
+func (p *permit) reportNeutral() { p.g.reportNeutral(p.probe) }
+
 // acquire 는 호출 자격을 얻을 때까지 기다린다. 성공하면 release 를 반드시 호출해야 한다.
+// 결과를 브레이커에 알리지 않는 곳(client 게이트)에서 쓴다.
 func (g *gate) acquire(ctx context.Context) (release func(), err error) {
-	return g.acquireWithin(ctx, 0)
+	pm, err := g.acquireWithin(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	return pm.release, nil
 }
 
 // acquireWithin 은 acquire 와 같되, maxWait(>0)이 있으면 예상 대기가 그보다 길 때 기다리지 않고 바로
 // ErrWaitTooLong 을 돌려주고, 실제 대기도 maxWait 로 자른다(queue_timeout 이 더 짧으면 그쪽).
-func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (release func(), err error) {
-	if !g.breakerAdmit() {
+func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (pm *permit, err error) {
+	admit, probe := g.breakerAdmit()
+	if !admit {
 		g.stats.BreakerSkips.Add(1)
 		return nil, ErrBreakerOpen
+	}
+	if probe {
+		// 시험 자리를 얻었는데 호출까지 못 가면(대기열·max_wait·시간 초과) 자리를 돌려준다.
+		defer func() {
+			if err != nil {
+				g.releaseProbe()
+			}
+		}()
 	}
 	if g.maxQueue > 0 && g.waiting.Load() >= int64(g.maxQueue) {
 		g.stats.QueueRejects.Add(1)
@@ -158,24 +192,15 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 			return nil, stop()
 		}
 	}
-	releaseSlot := func() {
+	if err := g.waitRate(wctx); err != nil {
 		if g.slots != nil {
 			<-g.slots
 		}
-	}
-	if err := g.waitRate(wctx); err != nil {
-		releaseSlot()
 		return nil, stop()
 	}
 	g.inFlight.Add(1)
 	g.stats.Calls.Add(1)
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			g.inFlight.Add(-1)
-			releaseSlot()
-		})
-	}, nil
+	return &permit{g: g, probe: probe}, nil
 }
 
 // estimateWait 는 지금 들어온 요청이 호출을 시작하기까지 기다릴 시간을 어림한다.
@@ -280,21 +305,28 @@ func (g *gate) deferRate(until time.Time) {
 
 // breakerAdmit 은 브레이커가 요청을 들여보내는지다. 열린 뒤 쿨다운이 지나면(half-open) 시험 요청 한 건만
 // 들여보내고, 그 결과가 나올 때까지(최대 쿨다운 한 번) 나머지는 계속 막는다.
-func (g *gate) breakerAdmit() bool {
+func (g *gate) breakerAdmit() (admit, probe bool) {
 	if g.breakerFailures <= 0 {
-		return true
+		return true, false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.tripped {
-		return true
+		return true, false
 	}
 	now := time.Now()
 	if now.Before(g.openUntil) || now.Before(g.probeUntil) {
-		return false
+		return false, false
 	}
 	g.probeUntil = now.Add(g.breakerCooldown) // 시험 요청 자리. 결과가 안 오면 이 시각 뒤 다른 요청이 시험한다
-	return true
+	return true, true
+}
+
+// releaseProbe 는 시험 요청 자리를 돌려준다(시험 요청이 판정 없이 끝났을 때). 다음 요청이 다시 시험한다.
+func (g *gate) releaseProbe() {
+	g.mu.Lock()
+	g.probeUntil = time.Time{}
+	g.mu.Unlock()
 }
 
 // breakerBlocked 는 지금 요청이 브레이커에 막힐지다(시험 자리를 쓰지 않는다).
@@ -309,19 +341,17 @@ func (g *gate) breakerBlocked() bool {
 }
 
 // reportNeutral 은 provider 탓이 아닌 실패(호출자 요청 오류·응답 검증 실패)를 통계에만 반영한다.
-// 서킷 브레이커의 연속 실패 횟수는 건드리지 않는다.
-func (g *gate) reportNeutral() {
+// 서킷 브레이커의 연속 실패 횟수는 건드리지 않는다. 시험 요청이었다면 판정 없이 끝난 것이므로 자리를 돌려준다.
+func (g *gate) reportNeutral(probe bool) {
 	g.stats.Fail.Add(1)
-	if g.breakerFailures <= 0 {
-		return
+	if probe {
+		g.releaseProbe()
 	}
-	g.mu.Lock()
-	g.probeUntil = time.Time{} // 시험 요청이 판정 없이 끝났으면 다음 요청이 다시 시험한다
-	g.mu.Unlock()
 }
 
-// report 는 호출 결과를 서킷 브레이커와 통계에 반영한다.
-func (g *gate) report(ok bool) {
+// report 는 호출 결과를 서킷 브레이커와 통계에 반영한다. 브레이커가 열린 동안에는 시험 요청(probe)의
+// 결과만 센다 — 열리기 전에 들어가 있던 요청이 늦게 성공해도 쿨다운 중에 닫히지 않는다.
+func (g *gate) report(ok, probe bool) {
 	if ok {
 		g.stats.OK.Add(1)
 	} else {
@@ -332,14 +362,18 @@ func (g *gate) report(ok bool) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.tripped && !probe {
+		return
+	}
 	if ok {
 		g.consecFail = 0
 		g.tripped = false
+		g.probeUntil = time.Time{}
 		return
 	}
 	g.consecFail++
 	// half-open 시험 요청이 실패하면 기다리지 않고 바로 다시 연다.
-	if g.tripped || g.consecFail >= g.breakerFailures {
+	if probe || g.consecFail >= g.breakerFailures {
 		g.tripped = true
 		g.openUntil = time.Now().Add(g.breakerCooldown)
 		g.probeUntil = time.Time{}

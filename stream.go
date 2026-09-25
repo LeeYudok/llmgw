@@ -78,7 +78,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
+			pm, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -103,7 +103,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				}
 				return onLine(line)
 			})
-			release()
+			pm.release()
 			a.LatencyMS = time.Since(t1).Milliseconds()
 			if started {
 				// 스트림이 시작된 뒤의 에러는 폴백하지 않고 그대로 돌려준다.
@@ -112,12 +112,12 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				errors.As(err, &ce)
 				switch {
 				case err == nil:
-					gt.report(true)
+					pm.report(true)
 					gt.lat.observe(time.Since(t1))
 				case ctx.Err() == nil && ce != nil:
-					gt.report(false)
+					pm.report(false)
 				default:
-					gt.reportNeutral()
+					pm.reportNeutral()
 				}
 				if err != nil {
 					a.setError(err)
@@ -139,9 +139,9 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 			var ce *callError
 			errors.As(err, &ce)
 			if ce != nil && !ce.providerFault() {
-				gt.reportNeutral()
+				pm.reportNeutral()
 			} else {
-				gt.report(false)
+				pm.report(false)
 			}
 			a.setError(err)
 			attempts = append(attempts, a)

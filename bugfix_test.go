@@ -240,3 +240,47 @@ func TestBreakerHalfOpen(t *testing.T) {
 		t.Fatalf("시험 요청이 성공하면 닫혀야 함: %v", err)
 	}
 }
+
+// 브레이커가 열린 동안 늦게 끝난 (시험 요청이 아닌) 요청의 성공은 브레이커를 닫지 않는다.
+func TestBreakerOnlyProbeCloses(t *testing.T) {
+	g := newGate(&ProviderConfig{BreakerFailures: 1, BreakerCooldown: Duration{time.Minute}, QueueTimeout: Duration{time.Second}})
+	old, err := g.acquireWithin(context.Background(), 0) // 열리기 전에 들어간 요청
+	if err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := g.acquireWithin(context.Background(), 0)
+	cur.report(false) // 이 실패로 열린다
+	cur.release()
+	old.report(true) // 늦게 성공해도
+	old.release()
+	if !g.breakerBlocked() {
+		t.Fatal("시험 요청이 아닌 성공이 쿨다운 중에 브레이커를 닫으면 안 됨")
+	}
+}
+
+// 시험 자리를 얻은 요청이 게이트 안에서 실패하면(호출 전) 자리를 돌려줘 다음 요청이 시험한다.
+func TestProbeReleasedOnAcquireFailure(t *testing.T) {
+	g := newGate(&ProviderConfig{BreakerFailures: 1, BreakerCooldown: Duration{time.Minute}, QueueTimeout: Duration{50 * time.Millisecond}})
+	g.mu.Lock()
+	g.tripped, g.openUntil = true, time.Now().Add(-time.Second) // 쿨다운이 끝나 half-open
+	g.next = time.Now().Add(time.Second)                         // Retry-After 로 1초 밀림 → 50ms 대기 안에 못 나감
+	g.mu.Unlock()
+	if _, err := g.acquireWithin(context.Background(), 0); err == nil {
+		t.Fatal("대기 마감 안에 자리가 없어 실패해야 함")
+	}
+	if g.breakerBlocked() {
+		t.Fatal("호출 전에 실패한 시험 요청은 자리를 돌려줘야 함(쿨다운 한 번 더 막히면 안 됨)")
+	}
+	g.mu.Lock()
+	g.next = time.Time{}
+	g.mu.Unlock()
+	pm, err := g.acquireWithin(context.Background(), 0)
+	if err != nil || !pm.probe {
+		t.Fatalf("다음 요청이 시험 요청이 되어야 함: %v", err)
+	}
+	pm.report(true)
+	pm.release()
+	if g.breakerBlocked() {
+		t.Fatal("시험 요청이 성공하면 닫혀야 함")
+	}
+}
