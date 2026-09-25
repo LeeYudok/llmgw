@@ -48,7 +48,7 @@ routes:
       min_chars: 40
       must_contain: [요약, 영향]
     steps:
-      - {provider: upstage, reasoning: "off", max_tokens: 1024, retries: 1, max_retry_wait: 5s}
+      - {provider: upstage, reasoning: "off", max_tokens: 1024, retries: 1, max_retry_wait: 5s, spill: auto}
       - {provider: qwen, reasoning: "on", max_tokens: 4096, retries: 1}
   reason:
     steps:

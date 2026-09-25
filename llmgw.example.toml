@@ -79,6 +79,7 @@ reasoning  = "off"
 max_tokens = 1024
 retries    = 1
 max_retry_wait = "5s"
+spill      = "auto"                  # qwen 에서 처리하는 편이 빨리 끝나겠으면 upstage 에서 기다리지 않고 넘긴다
 [[routes.news-deep.steps]]
 provider   = "qwen"
 reasoning  = "on"

@@ -133,6 +133,12 @@ type StepConfig struct {
 	Temperature  *float64 `toml:"temperature" yaml:"temperature"`
 	Retries      int      `toml:"retries" yaml:"retries"`               // 429·5xx·네트워크 오류 재시도 횟수
 	MaxRetryWait Duration `toml:"max_retry_wait" yaml:"max_retry_wait"` // Retry-After 가 이보다 길면 재시도 대신 다음 step
+	// MaxWait — 이 step 의 provider 에서 자리를 기다릴 최대 시간. 예상 대기가 이보다 길면 기다리지 않고 바로
+	// 다음 step 으로 넘긴다. 0 이면 provider 의 queue_timeout 만 적용한다. 마지막 step 에는 적용하지 않는다.
+	MaxWait Duration `toml:"max_wait" yaml:"max_wait"`
+	// Spill — "auto" 면 이 provider 에서 기다렸다 처리하는 예상 완료 시간(대기 + 평균 소요)이 다음 step 보다
+	// 길 때 바로 다음 step 으로 넘긴다. 두 provider 모두 소요 시간 기록이 쌓인 뒤에만 동작한다. 마지막 step 에는 적용하지 않는다.
+	Spill string `toml:"spill" yaml:"spill"`
 }
 
 // Validation 은 응답을 받아들일 조건이다. 어기면 재시도하지 않고 다음 step 으로 넘긴다.
@@ -260,6 +266,9 @@ func (c *Config) validate() error {
 			}
 			if s.Model == "" && p.Model == "" {
 				errs = append(errs, fmt.Errorf("route %s step %d: model 없음", name, i))
+			}
+			if s.Spill != "" && s.Spill != "auto" {
+				errs = append(errs, fmt.Errorf("route %s step %d: spill %q (auto 또는 비움)", name, i, s.Spill))
 			}
 			switch s.Reasoning {
 			case "off", "on", "low", "medium", "high", "inherit":
