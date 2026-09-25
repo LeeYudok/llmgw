@@ -98,10 +98,11 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				// 스트림이 시작된 뒤의 에러는 폴백하지 않고 그대로 돌려준다.
 				// 호출자 취소·전달 실패(onLine 에러)는 provider 실패로 세지 않는다.
 				var ce *callError
+				errors.As(err, &ce)
 				switch {
 				case err == nil:
 					gt.report(true)
-				case ctx.Err() == nil && errors.As(err, &ce):
+				case ctx.Err() == nil && ce != nil:
 					gt.report(false)
 				default:
 					gt.reportNeutral()
@@ -112,7 +113,11 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				attempts = append(attempts, a)
 				r := &Response{Provider: s.Provider, Model: model, Attempts: attempts, Latency: Duration{time.Since(start)}}
 				if err != nil {
-					return r, fmt.Errorf("스트림 중단(%s): %w", s.Provider, err)
+					// 호출자에게는 분류만 준다. upstream 원문은 Attempt.Detail 에 남아 있다.
+					if ce != nil {
+						return r, fmt.Errorf("스트림 중단(%s): %s", s.Provider, ce.public())
+					}
+					return r, fmt.Errorf("스트림 중단(%s): %w", s.Provider, err) // onLine 이 돌려준 호출자 쪽 에러
 				}
 				return r, nil
 			}

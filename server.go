@@ -263,7 +263,8 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 		} else {
 			gt.report(false)
 		}
-		writeErr(w, http.StatusBadGateway, transportError(err, false, false).public()) // 내부 주소를 내보내지 않는다
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		writeErr(w, http.StatusBadGateway, transportError(err, timedOut, false).public()) // 내부 주소를 내보내지 않는다
 		return
 	}
 	defer resp.Body.Close()

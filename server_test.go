@@ -596,3 +596,41 @@ func TestStreamIdleTimeout(t *testing.T) {
 		t.Fatalf("steady 줄 수 %d", lines)
 	}
 }
+
+func TestStreamErrorAfterStartIsSanitized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {}\n\n")
+		w.(http.Flusher).Flush()
+		conn, _, _ := w.(http.Hijacker).Hijack() // 스트림 도중 연결을 끊는다
+		conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	resp, err := g.Stream(context.Background(), userReq("r", "x"), func([]byte) error { return nil })
+	if err == nil || err.Error() != "스트림 중단(a): 스트림 읽기 실패" {
+		t.Fatalf("시작 뒤 에러도 분류만 돌려줘야 함: %v", err)
+	}
+	if a := resp.Attempts[0]; a.Detail == "" || !strings.Contains(a.Detail, "스트림 읽기:") {
+		t.Fatalf("원문은 Detail 에 남아야 함: %+v", a)
+	}
+}
+
+func TestPassthroughTimeoutClassified(t *testing.T) {
+	slow := newFake(t, func(_ int64, w http.ResponseWriter) { time.Sleep(300 * time.Millisecond) })
+	p := prov(slow.srv.URL)
+	p.Passthrough, p.Timeout = true, Duration{50 * time.Millisecond}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": p},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	s := serve(t, g)
+	code, out := post(t, s.URL+"/passthrough/a/parse", "", `{}`)
+	if msg := out["error"].(map[string]any)["message"]; code != 502 || msg != "타임아웃" {
+		t.Fatalf("passthrough 타임아웃은 타임아웃으로 분류해야 함: %d %v", code, msg)
+	}
+}
