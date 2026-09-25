@@ -337,7 +337,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquireWithin(ctx, stepMaxWait(route, i))
+			release, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -445,12 +445,15 @@ func (g *Gateway) autoSpill(route *RouteConfig, i int, noExternal bool) string {
 	return ""
 }
 
-// stepMaxWait 는 i 번째 step 의 max_wait 다. 마지막 step 은 넘길 곳이 없으므로 적용하지 않는다.
-func stepMaxWait(route *RouteConfig, i int) time.Duration {
-	if i == len(route.Steps)-1 {
-		return 0
+// stepMaxWait 는 i 번째 step 의 max_wait 다. 뒤에 실제로 시도할 step 이 없으면(마지막 step 이거나,
+// 남은 step 이 모두 외부 차단으로 건너뛸 external provider 면) 넘길 곳이 없으므로 적용하지 않는다.
+func (g *Gateway) stepMaxWait(route *RouteConfig, i int, noExternal bool) time.Duration {
+	for j := i + 1; j < len(route.Steps); j++ {
+		if !(noExternal && g.cfg.Providers[route.Steps[j].Provider].External) {
+			return route.Steps[i].MaxWait.Duration
+		}
 	}
-	return route.Steps[i].MaxWait.Duration
+	return 0
 }
 
 // backoff 는 0.5s·1s·2s… 지수 증가에 0~250ms 지터를 더한다(최대 8s).

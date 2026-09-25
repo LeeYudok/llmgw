@@ -144,3 +144,57 @@ func TestSpillConfigValidation(t *testing.T) {
 		t.Fatalf("잘못된 spill 값을 잡아야 함: %v", err)
 	}
 }
+
+func TestMaxWaitIgnoredWhenOnlyBlockedStepsRemain(t *testing.T) {
+	a := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "a") })
+	ext := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "ext") })
+	pa := prov(a.srv.URL)
+	pa.RPM, pa.QueueTimeout = 60, Duration{5 * time.Second}
+	pe := prov(ext.srv.URL)
+	pe.External = true
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": pa, "ext": pe},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a", MaxWait: Duration{200 * time.Millisecond}}, {Provider: "ext"}}}},
+	})
+	if g.stepMaxWait(g.cfg.Routes["r"], 0, false) == 0 || g.stepMaxWait(g.cfg.Routes["r"], 0, true) != 0 {
+		t.Fatal("남은 step 이 모두 외부 차단이면 max_wait 를 적용하지 않아야 함")
+	}
+	req := func(s string) Request { r := userReq("r", s); r.NoExternal = true; return r }
+	if _, err := g.Call(context.Background(), req("1")); err != nil {
+		t.Fatal(err)
+	}
+	// a 는 1초 뒤에야 자리가 나지만 넘길 곳이 없으므로 기다려서 처리한다.
+	if r, err := g.Call(context.Background(), req("2")); err != nil || r.Provider != "a" {
+		t.Fatalf("외부 차단 요청은 a 에서 기다려야 함: %v %v", r, err)
+	}
+	if ext.calls.Load() != 0 {
+		t.Fatal("외부 provider 를 호출하면 안 됨")
+	}
+}
+
+func TestMaxWaitExpiryCountsAsEarlySpill(t *testing.T) {
+	release := make(chan struct{})
+	a := newFake(t, func(_ int64, w http.ResponseWriter) { <-release; okJSON(w, "a") })
+	b := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "b") })
+	pa := prov(a.srv.URL)
+	pa.MaxConcurrency = 1 // 소요 시간 기록이 없어 예상 대기는 0 → 실제로 max_wait 만큼 기다린 뒤 넘긴다
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": pa, "b": prov(b.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a", MaxWait: Duration{100 * time.Millisecond}}, {Provider: "b"}}}},
+	})
+	done := make(chan struct{})
+	go func() { g.Call(context.Background(), userReq("r", "hold")); close(done) }()
+	for len(g.gates["a"].slots) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	r, err := g.Call(context.Background(), userReq("r", "next"))
+	close(release)
+	<-done
+	if err != nil || r.Provider != "b" {
+		t.Fatalf("%v %v", r, err)
+	}
+	st := g.Stats()["a"]
+	if !strings.Contains(r.Attempts[0].Error, ErrWaitTooLong.Error()) || st.EarlySpills != 1 || st.QueueTimeouts != 0 {
+		t.Fatalf("max_wait 만료는 early spill 로 세야 함: attempt %+v stats %+v", r.Attempts[0], st)
+	}
+}

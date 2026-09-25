@@ -132,8 +132,16 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 	defer g.waiting.Add(-1)
 
 	timeout := g.queueTimeout
-	if maxWait > 0 && maxWait < timeout {
+	capped := maxWait > 0 && maxWait < timeout // max_wait 가 대기 시간을 줄였는가
+	if capped {
 		timeout = maxWait
+	}
+	stop := func() error {
+		if capped && ctx.Err() == nil {
+			g.stats.EarlySpills.Add(1)
+			return fmt.Errorf("%w: max_wait %s 동안 자리 없음", ErrWaitTooLong, maxWait)
+		}
+		return g.waitErr(ctx)
 	}
 	wctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -145,7 +153,7 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 			g.blocked.Add(-1)
 		case <-wctx.Done():
 			g.blocked.Add(-1)
-			return nil, g.waitErr(ctx)
+			return nil, stop()
 		}
 	}
 	releaseSlot := func() {
@@ -155,7 +163,7 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 	}
 	if err := g.waitRate(wctx); err != nil {
 		releaseSlot()
-		return nil, g.waitErr(ctx)
+		return nil, stop()
 	}
 	g.inFlight.Add(1)
 	g.stats.Calls.Add(1)
