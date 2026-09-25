@@ -161,6 +161,10 @@ func (g *gate) breakerOpen() bool {
 	return time.Now().Before(g.openUntil)
 }
 
+// reportNeutral 은 provider 탓이 아닌 실패(호출자 요청 오류·응답 검증 실패)를 통계에만 반영한다.
+// 서킷 브레이커의 연속 실패 횟수는 건드리지 않는다.
+func (g *gate) reportNeutral() { g.stats.Fail.Add(1) }
+
 // report 는 호출 결과를 서킷 브레이커와 통계에 반영한다.
 func (g *gate) report(ok bool) {
 	if ok {

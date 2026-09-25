@@ -10,6 +10,7 @@ OpenAI 호환 엔드포인트 여러 개를 설정 파일(TOML 또는 YAML) 하�
 - **route**: 호출 이름. `steps` 를 위에서부터 시도한다. 순서를 바꾸면 우선순위가 바뀐다.
 - **step**: provider + 추론(`off|on|low|medium|high|inherit`) + `max_tokens` + `retries` + `max_retry_wait`.
   `inherit` 는 호출자가 보낸 `chat_template_kwargs.enable_thinking` 이나 `reasoning_effort` 를 따른다(없으면 off).
+  `reasoning_effort` 의 `none` 은 off, `minimal` 은 low, `xhigh` 는 high 로 맞추고, 모르는 값은 지정 없음으로 본다.
   기존 앱이 기능마다 추론을 켜고 끄던 것을 게이트웨이 뒤에서도 그대로 유지할 때 쓴다.
 - **client**: 게이트웨이를 부르는 서비스 하나. 서버 모드에서 Bearer 키로 식별하고, 허용 라우트(`routes`)·
   중계 허용 provider(`passthrough`)·자기 몫의 한도(`rpm`, `max_concurrency`, `max_queue`, `queue_timeout`)를 가진다.
@@ -24,7 +25,7 @@ OpenAI 호환 엔드포인트 여러 개를 설정 파일(TOML 또는 YAML) 하�
 | 대기열이 가득 참 | 기다리지 않고 다음 step 으로 넘긴다 |
 | `queue_timeout` 동안 자리를 못 얻음 | 다음 step 으로 넘긴다 |
 | 429·5xx·네트워크 오류 | `Retry-After`(없으면 0.5s·1s·2s 지수 백오프)만큼 기다렸다 재시도. `max_retry_wait` 보다 길면 기다리지 않고 다음 step. 429 는 같은 provider 를 쓰는 다른 요청도 같이 늦춘다 |
-| 연속 실패 `breaker_failures` 회 | `breaker_cooldown` 동안 그 provider 를 건너뛴다 |
+| 연속 실패 `breaker_failures` 회 | `breaker_cooldown` 동안 그 provider 를 건너뛴다. 네트워크 오류·타임아웃·408·429·5xx 만 센다(호출자 취소, 400 같은 요청 오류, 응답 검증 실패는 세지 않는다) |
 | 응답 검증 실패(빈 응답, JSON 아님, 필수 문구 없음, 너무 짧음) | 재시도 없이 다음 step |
 | 같은 요청이 동시에 여러 번 | 한 번만 호출하고 결과를 나눠 준다. `cache_ttl` 이 있으면 그동안 재사용 |
 
@@ -47,6 +48,9 @@ max_queue       = 32                  # 넘치면 즉시 429 (Retry-After: 5)
 | 403 | 허용되지 않은 라우트 또는 passthrough |
 | 429 | 클라이언트 한도 초과 |
 | 502 | 모든 step 실패(`attempts` 에 시도 기록) |
+
+clients 를 정의했으면 인증 없이는 열리지 않는다. `serve` 는 클라이언트의 `api_key_env` 가 하나라도 비어 있으면
+기동하지 않는다(라이브러리는 `Gateway.CheckClientKeys` 로 확인).
 
 `/v1/models` 는 호출한 클라이언트가 쓸 수 있는 라우트만 보여준다. `/stats` 는 provider·client 별
 호출 수·성공·실패·거절·토큰·대기 중 요청 수를 돌려준다. `log_path` 를 주면 요청 1건당 JSONL 한 줄

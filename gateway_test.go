@@ -343,3 +343,80 @@ provider = "nope"
 		t.Fatal("잘못된 설정이 통과함")
 	}
 }
+
+func TestBreakerIgnoresCallerFaults(t *testing.T) {
+	// 400(호출자 요청 오류)·검증 실패는 provider 를 막지 않는다.
+	bad := newFake(t, func(_ int64, w http.ResponseWriter) { http.Error(w, "bad request", 400) })
+	junk := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "JSON 아님") })
+	pb, pj := prov(bad.srv.URL), prov(junk.srv.URL)
+	pb.BreakerFailures, pb.BreakerCooldown = 2, Duration{time.Minute}
+	pj.BreakerFailures, pj.BreakerCooldown = 2, Duration{time.Minute}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"b": pb, "j": pj},
+		Routes: map[string]*RouteConfig{
+			"bad":  {Steps: []StepConfig{{Provider: "b"}}},
+			"junk": {Steps: []StepConfig{{Provider: "j"}}, Validate: Validation{RequireJSON: true}},
+		},
+	})
+	for i := range 4 {
+		g.Call(context.Background(), userReq("bad", fmt.Sprint(i)))
+		g.Call(context.Background(), userReq("junk", fmt.Sprint(i)))
+	}
+	if bad.calls.Load() != 4 || junk.calls.Load() != 4 {
+		t.Fatalf("브레이커가 열리면 안 됨: bad %d회 junk %d회", bad.calls.Load(), junk.calls.Load())
+	}
+	st := g.Stats()
+	if st["b"].BreakerSkips != 0 || st["j"].BreakerSkips != 0 || st["b"].Fail != 4 || st["j"].Fail != 4 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestBreakerIgnoresCallerCancel(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { time.Sleep(200 * time.Millisecond); okJSON(w, "ok") })
+	p := prov(f.srv.URL)
+	p.BreakerFailures, p.BreakerCooldown = 1, Duration{time.Minute}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": p},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a", Retries: 2}}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := g.Call(ctx, userReq("r", "취소")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("호출자 ctx 에러여야 함: %v", err)
+	}
+	if _, err := g.Call(context.Background(), userReq("r", "다음")); err != nil {
+		t.Fatalf("호출자 취소 뒤에도 브레이커가 닫혀 있어야 함: %v", err)
+	}
+	if f.calls.Load() != 2 {
+		t.Fatalf("취소된 요청은 재시도하지 않아야 함: %d회", f.calls.Load())
+	}
+}
+
+func TestFinishReasonPropagated(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) {
+		fmt.Fprint(w, `{"model":"m","choices":[{"finish_reason":"length","message":{"content":"잘린 본문"}}]}`)
+	})
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(f.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	s := serve(t, g)
+	code, out := post(t, s.URL+"/v1/chat/completions", "", `{"model":"r","messages":[{"role":"user","content":"x"}]}`)
+	if code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	if fr := out["choices"].([]any)[0].(map[string]any)["finish_reason"]; fr != "length" {
+		t.Fatalf("finish_reason 은 provider 값(length)이어야 함: %v", fr)
+	}
+}
+
+func TestNormalizeReasoning(t *testing.T) {
+	for in, want := range map[string]string{
+		"": "", "none": "off", "OFF": "off", "minimal": "low", "low": "low", "on": "on",
+		"medium": "medium", "high": "high", "xhigh": "high", "weird": "",
+	} {
+		if got := normalizeReasoning(in); got != want {
+			t.Errorf("normalizeReasoning(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

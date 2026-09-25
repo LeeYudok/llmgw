@@ -22,7 +22,8 @@ import (
 //	GET  /healthz
 //
 // clients 가 설정돼 있으면 Authorization: Bearer <client key> 로 호출자를 식별하고,
-// 없으면 인증 없이 모든 라우트를 연다(127.0.0.1 바인드 전제).
+// 없으면 인증 없이 모든 라우트를 연다(127.0.0.1 바인드 전제). clients 가 있는데 키 환경변수가 비어 있으면
+// 그 클라이언트는 인증할 수 없을 뿐 서버가 열리지는 않는다 — 기동 전에 CheckClientKeys 로 확인한다.
 func (g *Gateway) Handler() http.Handler {
 	auth := newAuthenticator(g.cfg.Clients)
 	mux := http.NewServeMux()
@@ -49,11 +50,12 @@ func (g *Gateway) Handler() http.Handler {
 
 // authenticator 는 Bearer 키를 클라이언트 이름으로 바꾼다.
 type authenticator struct {
+	open bool              // clients 를 하나도 정의하지 않았을 때만 인증 없이 연다
 	keys map[string]string // client → key
 }
 
 func newAuthenticator(clients map[string]*ClientConfig) *authenticator {
-	a := &authenticator{keys: map[string]string{}}
+	a := &authenticator{open: len(clients) == 0, keys: map[string]string{}}
 	for name, c := range clients {
 		if k := os.Getenv(c.APIKeyEnv); k != "" {
 			a.keys[name] = k
@@ -64,7 +66,7 @@ func newAuthenticator(clients map[string]*ClientConfig) *authenticator {
 
 func (a *authenticator) wrap(h func(http.ResponseWriter, *http.Request, string)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if len(a.keys) == 0 {
+		if a.open {
 			h(w, r, "")
 			return
 		}
@@ -77,6 +79,21 @@ func (a *authenticator) wrap(h func(http.ResponseWriter, *http.Request, string))
 		}
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 	}
+}
+
+// CheckClientKeys 는 clients 의 api_key_env 가 모두 채워져 있는지 확인한다. 서버 모드 기동 전에 부른다.
+func (g *Gateway) CheckClientKeys() error {
+	var missing []string
+	for name, c := range g.cfg.Clients {
+		if os.Getenv(c.APIKeyEnv) == "" {
+			missing = append(missing, name+"("+c.APIKeyEnv+")")
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	sort.Strings(missing)
+	return errors.New("client 키 환경변수가 비어 있음: " + strings.Join(missing, ", "))
 }
 
 func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client string) {
@@ -101,7 +118,7 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		Client: client, Route: in.Model, Messages: in.Messages, MaxTokens: in.MaxTokens,
 		Temperature: in.Temperature, ResponseFormat: in.ResponseFormat,
 		NoExternal: isTrue(r.Header.Get("X-LLMGW-No-External")),
-		Reasoning:  in.ReasoningEffort,
+		Reasoning:  normalizeReasoning(in.ReasoningEffort),
 	}
 	if et := in.ChatTemplateKwargs.EnableThinking; et != nil && req.Reasoning == "" {
 		req.Reasoning = map[bool]string{true: "on", false: "off"}[*et]
@@ -115,6 +132,10 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		g.writeCallErr(w, err)
 		return
 	}
+	finish := resp.FinishReason
+	if finish == "" {
+		finish = "stop"
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":      "llmgw-" + time.Now().Format("20060102150405.000000"),
 		"object":  "chat.completion",
@@ -122,7 +143,7 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		"model":   resp.Model,
 		"choices": []map[string]any{{
 			"index":         0,
-			"finish_reason": "stop",
+			"finish_reason": finish,
 			"message":       map[string]any{"role": "assistant", "content": resp.Content, "reasoning_content": resp.Reasoning},
 		}},
 		"usage": map[string]any{
@@ -235,7 +256,11 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	}
 	resp, err := g.hc.Do(out)
 	if err != nil {
-		gt.report(false)
+		if r.Context().Err() != nil {
+			gt.reportNeutral() // 호출자가 끊은 것은 provider 실패가 아니다
+		} else {
+			gt.report(false)
+		}
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}

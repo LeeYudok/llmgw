@@ -375,6 +375,8 @@ func TestReasoningInherit(t *testing.T) {
 		`{"model":"q","messages":[{"role":"user","content":"2"}]}`,
 		`{"model":"u","messages":[{"role":"user","content":"3"}],"reasoning_effort":"low"}`,
 		`{"model":"u","messages":[{"role":"user","content":"4"}],"chat_template_kwargs":{"enable_thinking":false}}`,
+		`{"model":"q","messages":[{"role":"user","content":"5"}],"reasoning_effort":"none"}`,
+		`{"model":"u","messages":[{"role":"user","content":"6"}],"reasoning_effort":"minimal"}`,
 	} {
 		if code, out := post(t, s.URL+"/v1/chat/completions", "", body); code != 200 {
 			t.Fatalf("%d %v", code, out)
@@ -392,6 +394,34 @@ func TestReasoningInherit(t *testing.T) {
 	}
 	if _, ok := b[3]["reasoning_effort"]; ok {
 		t.Fatalf("enable_thinking=false 면 effort 를 보내지 않아야 함: %v", b[3])
+	}
+	if kw := b[4]["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != false {
+		t.Fatalf("reasoning_effort=none 이면 추론을 꺼야 함: %v", b[4])
+	}
+	if b[5]["reasoning_effort"] != "low" {
+		t.Fatalf("reasoning_effort=minimal 은 low 로 보내야 함: %v", b[5])
+	}
+}
+
+func TestClientKeysMissingFailsClosed(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "hi") })
+	t.Setenv("KEY_EMPTY", "")
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"p": prov(f.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "p"}}}},
+		Clients:   map[string]*ClientConfig{"app": {APIKeyEnv: "KEY_EMPTY"}},
+	})
+	if err := g.CheckClientKeys(); err == nil || !strings.Contains(err.Error(), "KEY_EMPTY") {
+		t.Fatalf("비어 있는 키를 알려야 함: %v", err)
+	}
+	s := serve(t, g)
+	for _, key := range []string{"", "anything"} {
+		if code, _ := post(t, s.URL+"/v1/chat/completions", key, `{"model":"r","messages":[{"role":"user","content":"x"}]}`); code != 401 {
+			t.Fatalf("clients 가 있는데 키가 비면 인증 없이 열리면 안 됨(key=%q): %d", key, code)
+		}
+	}
+	if f.calls.Load() != 0 {
+		t.Fatalf("upstream 이 호출되면 안 됨: %d", f.calls.Load())
 	}
 }
 

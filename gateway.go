@@ -34,14 +34,16 @@ type Request struct {
 
 // Response 는 최종 성공 응답과 거쳐온 시도 기록이다.
 type Response struct {
-	Content   string    `json:"content"`
-	Reasoning string    `json:"reasoning,omitempty"`
-	Provider  string    `json:"provider"`
-	Model     string    `json:"model"`
-	Usage     Usage     `json:"usage"`
-	Attempts  []Attempt `json:"attempts"`
-	Cached    bool      `json:"cached,omitempty"`
-	Latency   Duration  `json:"-"`
+	Content   string `json:"content"`
+	Reasoning string `json:"reasoning,omitempty"`
+	// FinishReason 은 provider 가 준 종료 사유(stop, length 등)다. length 면 max_tokens 에서 잘린 것이다.
+	FinishReason string    `json:"finish_reason,omitempty"`
+	Provider     string    `json:"provider"`
+	Model        string    `json:"model"`
+	Usage        Usage     `json:"usage"`
+	Attempts     []Attempt `json:"attempts"`
+	Cached       bool      `json:"cached,omitempty"`
+	Latency      Duration  `json:"-"`
 }
 
 // Attempt 는 시도 1회의 결과다. Error 가 비어 있으면 성공이다.
@@ -272,7 +274,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					verr = checkSchema(c.content, schemaOf(req.ResponseFormat))
 				}
 				if verr != nil {
-					gt.report(false)
+					gt.reportNeutral() // 요청 내용에 따라 갈리는 실패라 provider 전체를 막지 않는다
 					a.Error = "검증 실패: " + verr.Error()
 					attempts = append(attempts, a)
 					break // 같은 설정으로 다시 불러도 같은 결과일 가능성이 커서 다음 step 으로
@@ -283,14 +285,21 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					c.model = model
 				}
 				return &Response{
-					Content: c.content, Reasoning: c.reasoning, Provider: s.Provider, Model: c.model,
+					Content: c.content, Reasoning: c.reasoning, FinishReason: c.finish, Provider: s.Provider, Model: c.model,
 					Usage: c.usage, Attempts: attempts, Latency: Duration{time.Since(start)},
 				}, nil
 			}
 
-			gt.report(false)
+			if ctx.Err() != nil {
+				return nil, ctx.Err() // 호출자 취소는 provider 실패로 세지 않는다
+			}
 			var ce *callError
 			errors.As(err, &ce)
+			if ce != nil && !ce.providerFault() {
+				gt.reportNeutral()
+			} else {
+				gt.report(false)
+			}
 			a.Error = err.Error()
 			if ce != nil {
 				a.Status = ce.status
