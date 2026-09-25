@@ -59,6 +59,9 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 		gt := g.gates[s.Provider]
 		body := buildBody(p, s, &req)
 		body["stream"] = true
+		if p.StreamUsage {
+			body["stream_options"] = map[string]any{"include_usage": true}
+		}
 		model, _ := body["model"].(string)
 		if p.External && req.NoExternal {
 			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: ErrExternalBlocked.Error()})
@@ -87,7 +90,11 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 			}
 			t1 := time.Now()
 			first := true
+			var usage Usage
 			started, err := doStream(ctx, g.hc, p, g.keys[s.Provider], body, func(line []byte) error {
+				if u, ok := usageFromSSE(line); ok {
+					usage = u
+				}
 				if first {
 					first = false
 					if onStart != nil {
@@ -116,7 +123,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 					a.setError(err)
 				}
 				attempts = append(attempts, a)
-				r := &Response{Provider: s.Provider, Model: model, Attempts: attempts, Latency: Duration{time.Since(start)}}
+				r := &Response{Provider: s.Provider, Model: model, Usage: usage, Attempts: attempts, Latency: Duration{time.Since(start)}}
 				if err != nil {
 					// 호출자에게는 분류만 준다. upstream 원문은 Attempt.Detail 에 남아 있다.
 					if ce != nil {
@@ -157,6 +164,28 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 		}
 	}
 	return nil, &ChainError{Attempts: attempts}
+}
+
+// usageFromSSE 는 SSE 한 줄에 usage 가 실려 있으면 꺼낸다(stream_options.include_usage 의 마지막 청크 등).
+func usageFromSSE(line []byte) (Usage, bool) {
+	data, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
+	if !ok || !bytes.Contains(data, []byte(`"usage"`)) {
+		return Usage{}, false
+	}
+	var c struct {
+		Usage *struct {
+			PromptTokens            int `json:"prompt_tokens"`
+			CompletionTokens        int `json:"completion_tokens"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(data), &c) != nil || c.Usage == nil {
+		return Usage{}, false
+	}
+	return Usage{PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens,
+		ReasoningTokens: c.Usage.CompletionTokensDetails.ReasoningTokens}, true
 }
 
 // doStream 은 stream:true 로 호출한다. 200 을 받아 첫 줄을 넘기기 시작하면 started=true.
@@ -202,11 +231,12 @@ func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey
 	for {
 		line, rerr := rd.ReadBytes('\n')
 		if len(line) > 0 {
-			timer.Reset(idle)
 			started = true
+			timer.Stop() // 호출자에게 넘기는 동안은 idle 로 세지 않는다(느린 호출자 탓을 provider 에 돌리지 않게)
 			if err := onLine(line); err != nil {
 				return true, err
 			}
+			timer.Reset(idle)
 		}
 		if rerr == io.EOF {
 			if !started {

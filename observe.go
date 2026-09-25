@@ -74,8 +74,10 @@ func (g *Gateway) record(req Request, resp *Response, err error, d time.Duration
 			if resp.Cached {
 				s.Cached.Add(1)
 			}
-			s.PromptTokens.Add(int64(resp.Usage.PromptTokens))
-			s.CompletionTokens.Add(int64(resp.Usage.CompletionTokens))
+			if !resp.Cached { // 캐시·합치기로 받은 응답은 upstream 을 다시 부르지 않았으므로 토큰을 세지 않는다
+				s.PromptTokens.Add(int64(resp.Usage.PromptTokens))
+				s.CompletionTokens.Add(int64(resp.Usage.CompletionTokens))
+			}
 		case errors.Is(err, ErrClientLimited) || errors.Is(err, ErrRouteNotAllowed):
 			s.Rejected.Add(1)
 		default:

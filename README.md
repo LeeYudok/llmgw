@@ -46,8 +46,8 @@ LLM 마다 입구(게이트)가 하나씩 있습니다. 요청은 브레이커·
 | `queue_timeout` 동안 자리를 못 얻음 | 다음 step 으로 넘긴다 |
 | step `spill = "auto"` 이고 다음 step 에서 더 빨리 끝날 것으로 보임 | 기다리지 않고 바로 다음 step 으로 넘긴다(아래 "빨리 넘기기") |
 | step `max_wait` 보다 오래 기다릴 것으로 보임 | 기다리지 않고 바로 다음 step 으로 넘긴다 |
-| 429·5xx·네트워크 오류 | `Retry-After`(없으면 0.5s·1s·2s 지수 백오프)만큼 기다렸다 재시도. `max_retry_wait` 보다 길면 기다리지 않고 다음 step. 429 는 같은 provider 를 쓰는 다른 요청도 같이 늦춘다 |
-| 연속 실패 `breaker_failures` 회 | `breaker_cooldown` 동안 그 provider 를 건너뛴다. 네트워크 오류·타임아웃·408·429·5xx 만 센다(호출자 취소, 400 같은 요청 오류, 응답 검증 실패는 세지 않는다) |
+| 429·5xx·네트워크 오류 | `Retry-After`(없으면 0.5s·1s·2s 지수 백오프)만큼 기다렸다 재시도(분당 한도 자리가 대기 마감보다 뒤면 기다리지 않는다). `max_retry_wait` 보다 길면 기다리지 않고 다음 step. 429 는 같은 provider 를 쓰는 다른 요청도 같이 늦춘다 |
+| 연속 실패 `breaker_failures` 회 | `breaker_cooldown` 동안 그 provider 를 건너뛴다. 쿨다운이 지나면 시험 요청 1건만 보내 성공하면 닫고, 실패하면 바로 다시 연다. 네트워크 오류·타임아웃·408·429·5xx 만 센다(호출자 취소, 400 같은 요청 오류, 응답 검증 실패는 세지 않는다) |
 | 응답 검증 실패(빈 응답, JSON 아님, 필수 문구 없음, 너무 짧음) | 재시도 없이 다음 step |
 | 같은 요청이 동시에 여러 번 | 한 번만 호출하고 결과를 나눠 준다. `cache_ttl` 이 있으면 그동안 재사용 |
 
@@ -106,7 +106,7 @@ clients 를 정의했으면 인증 없이는 열리지 않는다. `serve` 는 �
 - 클라이언트에 `allow_external = false`
 - 요청 헤더 `X-LLMGW-No-External: 1` (라이브러리는 `Request.NoExternal = true`)
 
-passthrough 도 같은 규칙을 따른다(차단이면 403).
+passthrough 도 같은 규칙을 따른다(차단이면 403). passthrough 경로에 `.`·`..`(인코딩 포함)이 있으면 400 으로 거절한다.
 
 ## 개인정보 마스킹
 
@@ -184,7 +184,8 @@ curl -s localhost:17902/stats
 
 `"stream": true` 면 provider 의 SSE 를 그대로 흘려보낸다. 첫 바이트를 받기 전의 실패(연결 오류·429·5xx)는
 평소처럼 재시도·폴백하고, 스트림이 시작된 뒤 끊기면 다른 provider 로 이어붙이지 않는다(부분 응답을 섞지 않는다).
-스트림 응답에는 검증·캐시를 적용하지 않는다. 라이브러리는 `Gateway.Stream`(시작 시점을 알고 싶으면 `StreamWithStart`)을 쓴다.
+스트림 응답에는 검증·캐시를 적용하지 않는다. 호출자가 느리게 읽는 시간은 idle 로 세지 않는다. provider 에 `stream_usage = true` 를 주면
+`stream_options.include_usage` 를 붙여 토큰 사용량을 받아 통계·로그에 남긴다(마지막에 choices 가 빈 청크가 하나 더 온다). 라이브러리는 `Gateway.Stream`(시작 시점을 알고 싶으면 `StreamWithStart`)을 쓴다.
 스트림에서 provider `timeout` 은 응답 헤더를 받을 때까지만 적용되고, 그 뒤로는 줄 사이 간격이
 `stream_idle_timeout`(기본 60s)을 넘으면 끊는다. 스트림 전체 길이에는 제한이 없어 긴 추론 응답도 잘리지 않는다.
 

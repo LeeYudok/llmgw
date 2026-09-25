@@ -75,6 +75,9 @@ type ProviderConfig struct {
 	// StreamIdleTimeout — 스트림이 시작된 뒤 이 시간 동안 새 줄이 오지 않으면 끊는다(기본 60s).
 	// timeout 은 스트림에서는 응답 헤더를 받을 때까지만 적용된다.
 	StreamIdleTimeout Duration `toml:"stream_idle_timeout" yaml:"stream_idle_timeout"`
+	// StreamUsage — true 면 스트림 요청에 stream_options.include_usage 를 붙여 토큰 사용량을 받는다(vLLM·OpenAI 지원).
+	// 마지막에 choices 가 빈 청크가 하나 더 오므로, 그것을 처리하지 못하는 호출자가 있으면 끈다.
+	StreamUsage bool `toml:"stream_usage" yaml:"stream_usage"`
 
 	Extra map[string]any `toml:"extra" yaml:"extra"` // 요청 body 에 그대로 합칠 추가 필드
 }

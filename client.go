@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -103,7 +102,9 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 		messages = append([]Message{{Role: "system", Content: hint}}, messages...)
 	}
 	body := map[string]any{"model": model, "messages": messages, "max_tokens": maxTokens}
-	maps.Copy(body, p.Extra)
+	for k, v := range p.Extra {
+		body[k] = deepCopy(v) // 안쪽 map 까지 복사한다 — 요청마다 고쳐 쓰므로 provider 설정과 공유하면 안 된다
+	}
 	switch {
 	case req.Temperature != nil:
 		body["temperature"] = *req.Temperature
@@ -148,6 +149,25 @@ func normalizeReasoning(v string) string {
 		return v
 	}
 	return ""
+}
+
+// deepCopy 는 설정에서 읽은 값(map·slice 중첩)을 통째로 복사한다.
+func deepCopy(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[k] = deepCopy(e)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = deepCopy(e)
+		}
+		return out
+	}
+	return v
 }
 
 // responseFormatFor 는 호출자가 준 response_format 을 provider 능력에 맞춘다.

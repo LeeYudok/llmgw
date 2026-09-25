@@ -34,7 +34,9 @@ type gate struct {
 	breakerFailures int
 	breakerCooldown time.Duration
 	consecFail      int
-	openUntil       time.Time
+	tripped         bool      // 브레이커가 열린 적이 있고 아직 성공으로 닫히지 않았다
+	openUntil       time.Time // 이 시각까지는 모두 막는다
+	probeUntil      time.Time // half-open 시험 요청이 진행 중인 동안 다른 요청을 막는다
 
 	waiting  atomic.Int64
 	blocked  atomic.Int64 // 동시 처리 슬롯을 기다리는 요청 수(waiting 의 일부)
@@ -114,7 +116,7 @@ func (g *gate) acquire(ctx context.Context) (release func(), err error) {
 // acquireWithin 은 acquire 와 같되, maxWait(>0)이 있으면 예상 대기가 그보다 길 때 기다리지 않고 바로
 // ErrWaitTooLong 을 돌려주고, 실제 대기도 maxWait 로 자른다(queue_timeout 이 더 짧으면 그쪽).
 func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (release func(), err error) {
-	if g.breakerOpen() {
+	if !g.breakerAdmit() {
 		g.stats.BreakerSkips.Add(1)
 		return nil, ErrBreakerOpen
 	}
@@ -184,12 +186,10 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 func (g *gate) estimateWait() time.Duration {
 	var d time.Duration
 	blocked := g.blocked.Load()
-	if g.interval > 0 {
-		g.mu.Lock()
-		r := time.Until(g.next)
-		g.mu.Unlock()
-		d = max(r, 0) + time.Duration(blocked)*g.interval
-	}
+	g.mu.Lock()
+	r := time.Until(g.next) // 분당 한도 예약, 또는 429 Retry-After 로 밀린 시각
+	g.mu.Unlock()
+	d = max(r, 0) + time.Duration(blocked)*g.interval
 	if g.slots != nil {
 		c := int64(cap(g.slots))
 		if ahead := int64(len(g.slots)) + blocked + 1 - c; ahead > 0 {
@@ -203,7 +203,7 @@ func (g *gate) estimateWait() time.Duration {
 
 // admits 는 지금 요청을 받을 수 있는 상태인지다(브레이커가 닫혀 있고 대기열에 자리가 있다).
 func (g *gate) admits() bool {
-	return !g.breakerOpen() && (g.maxQueue == 0 || g.waiting.Load() < int64(g.maxQueue))
+	return !g.breakerBlocked() && (g.maxQueue == 0 || g.waiting.Load() < int64(g.maxQueue))
 }
 
 // expectedFinish 는 지금 들어온 요청이 끝날 때까지의 예상 시간(대기 + 최근 평균 소요)이다.
@@ -225,18 +225,26 @@ func (g *gate) waitErr(ctx context.Context) error {
 	return ErrQueueTimeout
 }
 
+// errRateBeyondDeadline 은 분당 한도 자리가 대기 마감보다 뒤라서 예약하지 않았다는 뜻이다.
+var errRateBeyondDeadline = errors.New("분당 한도 자리가 대기 마감 뒤")
+
 // waitRate 는 분당 한도를 요청 간 고정 간격으로 지킨다(버스트 없음). 자리를 먼저 예약하고 그 시각까지 잔다.
+// rpm 이 없어도 429 Retry-After 로 밀린 시각(next)까지는 기다린다. 예약할 자리가 대기 마감(ctx deadline)보다
+// 뒤면 예약하지 않고 바로 돌려준다 — 기다려도 못 쓸 자리를 붙잡아 뒤 요청을 막지 않기 위해서다.
 func (g *gate) waitRate(ctx context.Context) error {
-	if g.interval == 0 {
-		return nil
-	}
 	g.mu.Lock()
 	now := time.Now()
 	at := g.next
 	if at.Before(now) {
 		at = now
 	}
-	g.next = at.Add(g.interval)
+	if dl, ok := ctx.Deadline(); ok && at.After(dl) {
+		g.mu.Unlock()
+		return errRateBeyondDeadline
+	}
+	if g.interval > 0 {
+		g.next = at.Add(g.interval)
+	}
 	g.mu.Unlock()
 
 	d := time.Until(at)
@@ -250,11 +258,13 @@ func (g *gate) waitRate(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		// 예약한 자리를 반납한다(뒤에 예약한 사람이 없을 때만 안전하게 되돌릴 수 있다).
-		g.mu.Lock()
-		if g.next.Equal(at.Add(g.interval)) {
-			g.next = at
+		if g.interval > 0 {
+			g.mu.Lock()
+			if g.next.Equal(at.Add(g.interval)) {
+				g.next = at
+			}
+			g.mu.Unlock()
 		}
-		g.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -268,18 +278,47 @@ func (g *gate) deferRate(until time.Time) {
 	g.mu.Unlock()
 }
 
-func (g *gate) breakerOpen() bool {
+// breakerAdmit 은 브레이커가 요청을 들여보내는지다. 열린 뒤 쿨다운이 지나면(half-open) 시험 요청 한 건만
+// 들여보내고, 그 결과가 나올 때까지(최대 쿨다운 한 번) 나머지는 계속 막는다.
+func (g *gate) breakerAdmit() bool {
+	if g.breakerFailures <= 0 {
+		return true
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.tripped {
+		return true
+	}
+	now := time.Now()
+	if now.Before(g.openUntil) || now.Before(g.probeUntil) {
+		return false
+	}
+	g.probeUntil = now.Add(g.breakerCooldown) // 시험 요청 자리. 결과가 안 오면 이 시각 뒤 다른 요청이 시험한다
+	return true
+}
+
+// breakerBlocked 는 지금 요청이 브레이커에 막힐지다(시험 자리를 쓰지 않는다).
+func (g *gate) breakerBlocked() bool {
 	if g.breakerFailures <= 0 {
 		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return time.Now().Before(g.openUntil)
+	now := time.Now()
+	return g.tripped && (now.Before(g.openUntil) || now.Before(g.probeUntil))
 }
 
 // reportNeutral 은 provider 탓이 아닌 실패(호출자 요청 오류·응답 검증 실패)를 통계에만 반영한다.
 // 서킷 브레이커의 연속 실패 횟수는 건드리지 않는다.
-func (g *gate) reportNeutral() { g.stats.Fail.Add(1) }
+func (g *gate) reportNeutral() {
+	g.stats.Fail.Add(1)
+	if g.breakerFailures <= 0 {
+		return
+	}
+	g.mu.Lock()
+	g.probeUntil = time.Time{} // 시험 요청이 판정 없이 끝났으면 다음 요청이 다시 시험한다
+	g.mu.Unlock()
+}
 
 // report 는 호출 결과를 서킷 브레이커와 통계에 반영한다.
 func (g *gate) report(ok bool) {
@@ -295,11 +334,15 @@ func (g *gate) report(ok bool) {
 	defer g.mu.Unlock()
 	if ok {
 		g.consecFail = 0
+		g.tripped = false
 		return
 	}
 	g.consecFail++
-	if g.consecFail >= g.breakerFailures {
+	// half-open 시험 요청이 실패하면 기다리지 않고 바로 다시 연다.
+	if g.tripped || g.consecFail >= g.breakerFailures {
+		g.tripped = true
 		g.openUntil = time.Now().Add(g.breakerCooldown)
+		g.probeUntil = time.Time{}
 		g.consecFail = 0
 	}
 }

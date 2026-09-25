@@ -210,6 +210,14 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 		writeErr(w, http.StatusNotFound, "passthrough provider 없음: "+name)
 		return
 	}
+	// 경로에 . / .. 이 있으면 base_url 밖으로 나갈 수 있으므로 거절한다. 전달은 인코딩된 원래 경로로 한다
+	// (디코딩한 경로를 이어 붙이면 %3F 같은 인코딩이 풀려 쿼리가 끼어든다).
+	for _, seg := range strings.Split(r.PathValue("path"), "/") {
+		if seg == ".." || seg == "." {
+			writeErr(w, http.StatusBadRequest, "passthrough 경로에 . 또는 .. 을 쓸 수 없음")
+			return
+		}
+	}
 	if c := g.cfg.Clients[client]; c != nil && !c.allowsPassthrough(name) {
 		writeErr(w, http.StatusForbidden, "허용되지 않은 passthrough: "+name)
 		return
@@ -236,7 +244,9 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	}
 	defer release()
 
-	target := p.BaseURL + "/" + r.PathValue("path")
+	raw := strings.TrimPrefix(r.URL.EscapedPath(), "/passthrough/")
+	_, rawPath, _ := strings.Cut(raw, "/")
+	target := p.BaseURL + "/" + rawPath
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
