@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strings"
@@ -47,6 +48,9 @@ func main() {
 	cfg, err := llmgw.LoadConfig(*cfgPath)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if lim := int64(cfg.Server.MemoryLimit); lim > 0 {
+		debug.SetMemoryLimit(lim) // GOMEMLIMIT 과 같다: 이 근처에서 GC 를 더 돌려 OOM 킬을 피한다
 	}
 	gw, err := llmgw.New(cfg)
 	if err != nil {

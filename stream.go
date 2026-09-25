@@ -166,6 +166,24 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 	return nil, &ChainError{Attempts: attempts}
 }
 
+var errLineTooLong = errors.New("줄이 너무 김")
+
+// readLine 은 줄바꿈까지 읽되 limit 바이트를 넘으면 errLineTooLong 을 돌려준다.
+// bufio.ReadBytes 는 줄바꿈이 올 때까지 끝없이 버퍼를 늘리므로, 줄바꿈 없이 큰 데이터가 오면 메모리를 다 쓴다.
+func readLine(rd *bufio.Reader, limit int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := rd.ReadSlice('\n')
+		if len(line)+len(chunk) > limit {
+			return nil, errLineTooLong
+		}
+		line = append(line, chunk...)
+		if err != bufio.ErrBufferFull {
+			return line, err
+		}
+	}
+}
+
 // usageFromSSE 는 SSE 한 줄에 usage 가 실려 있으면 꺼낸다(stream_options.include_usage 의 마지막 청크 등).
 func usageFromSSE(line []byte) (Usage, bool) {
 	data, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
@@ -217,7 +235,7 @@ func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return false, &callError{
 			status:     resp.StatusCode,
 			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
@@ -229,7 +247,7 @@ func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey
 	timer.Reset(idle)
 	rd := bufio.NewReaderSize(resp.Body, 64<<10)
 	for {
-		line, rerr := rd.ReadBytes('\n')
+		line, rerr := readLine(rd, int(p.MaxResponseBytes))
 		if len(line) > 0 {
 			started = true
 			timer.Stop() // 호출자에게 넘기는 동안은 idle 로 세지 않는다(느린 호출자 탓을 provider 에 돌리지 않게)
@@ -243,6 +261,9 @@ func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey
 				return false, &callError{msg: "빈 스트림", kind: "빈 스트림", retryable: true}
 			}
 			return true, nil
+		}
+		if rerr == errLineTooLong {
+			return started, &callError{msg: fmt.Sprintf("스트림 한 줄이 max_response_bytes(%d) 초과", p.MaxResponseBytes), kind: "스트림 줄이 너무 김", retryable: !started}
 		}
 		if rerr != nil {
 			if timedOut.Load() {
