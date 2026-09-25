@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -132,6 +133,7 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 		g.writeCallErr(w, err)
 		return
 	}
+	setMetaHeaders(w, resp)
 	finish := resp.FinishReason
 	if finish == "" {
 		finish = "stop"
@@ -158,7 +160,7 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 func (g *Gateway) serveStream(w http.ResponseWriter, r *http.Request, req Request) {
 	fl, _ := w.(http.Flusher)
 	headerSent := false
-	_, err := g.Stream(r.Context(), req, func(line []byte) error {
+	_, err := g.StreamWithStart(r.Context(), req, func(resp *Response) { setMetaHeaders(w, resp) }, func(line []byte) error {
 		if !headerSent {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
@@ -261,7 +263,8 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 		} else {
 			gt.report(false)
 		}
-		writeErr(w, http.StatusBadGateway, err.Error())
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		writeErr(w, http.StatusBadGateway, transportError(err, timedOut, false).public()) // 내부 주소를 내보내지 않는다
 		return
 	}
 	defer resp.Body.Close()
@@ -276,6 +279,21 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	}
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+// setMetaHeaders 는 실제 처리한 provider·모델·시도 횟수를 응답 헤더로 알린다.
+// 스트림 응답에는 본문에 llmgw 필드를 넣을 수 없어서 헤더로만 알 수 있다.
+func setMetaHeaders(w http.ResponseWriter, r *Response) {
+	h := w.Header()
+	h.Set("X-LLMGW-Provider", r.Provider)
+	h.Set("X-LLMGW-Model", r.Model)
+	h.Set("X-LLMGW-Attempts", strconv.Itoa(len(r.Attempts)))
+	if r.Cached {
+		h.Set("X-LLMGW-Cached", "1")
+	}
+	if n := len(r.Attempts); n > 0 && r.Attempts[n-1].Masked > 0 {
+		h.Set("X-LLMGW-Masked", strconv.Itoa(r.Attempts[n-1].Masked))
+	}
 }
 
 func isTrue(v string) bool {

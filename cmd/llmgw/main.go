@@ -12,6 +12,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -97,6 +98,10 @@ func cmdCall(ctx context.Context, gw *llmgw.Gateway, args []string) int {
 
 	resp, err := gw.Call(ctx, req)
 	if err != nil {
+		var ce *llmgw.ChainError
+		if errors.As(err, &ce) {
+			err = errors.New(ce.Detail())
+		}
 		log.Print(err)
 		return 1
 	}
@@ -108,6 +113,9 @@ func cmdCall(ctx context.Context, gw *llmgw.Gateway, args []string) int {
 		status := "ok"
 		if a.Error != "" {
 			status = a.Error
+			if a.Detail != "" && a.Detail != a.Error {
+				status += " — " + a.Detail // CLI 는 운영자용이라 upstream 원문까지 보여준다
+			}
 		}
 		fmt.Fprintf(os.Stderr, "    step%d %-10s %-6s wait=%dms call=%dms %s\n", a.Step, a.Provider, a.Reasoning, a.WaitedMS, a.LatencyMS, status)
 	}

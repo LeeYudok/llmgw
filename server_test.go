@@ -2,6 +2,7 @@ package llmgw
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -475,5 +476,161 @@ func TestStreamAllFailedIsJSONError(t *testing.T) {
 	code, out := post(t, s.URL+"/v1/chat/completions", "", `{"model":"r","stream":true,"messages":[{"role":"user","content":"x"}]}`)
 	if code != 502 || out["attempts"] == nil {
 		t.Fatalf("스트림 시작 전 전부 실패면 502 JSON: %d %v", code, out)
+	}
+}
+
+func TestUpstreamErrorNotLeakedToCaller(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) {
+		http.Error(w, `{"error":"internal host gpu-node-07.corp:8000 model /models/secret-path"}`, 500)
+	})
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "req.jsonl")
+	g := build(t, &Config{
+		LogPath:   logPath,
+		Providers: map[string]*ProviderConfig{"a": prov(f.srv.URL), "dead": prov("http://127.0.0.1:1")},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}, {Provider: "dead"}}}},
+	})
+	s := serve(t, g)
+	req, _ := http.NewRequest(http.MethodPost, s.URL+"/v1/chat/completions", strings.NewReader(`{"model":"r","messages":[{"role":"user","content":"x"}]}`))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	g.Close()
+	if resp.StatusCode != 502 {
+		t.Fatalf("status %d", resp.StatusCode)
+	}
+	for _, leak := range []string{"gpu-node-07", "secret-path", "127.0.0.1:1"} {
+		if strings.Contains(string(raw), leak) {
+			t.Fatalf("호출자 응답에 upstream 원문 %q 가 새어 나감: %s", leak, raw)
+		}
+	}
+	if !strings.Contains(string(raw), "HTTP 500") || !strings.Contains(string(raw), "연결 실패") {
+		t.Fatalf("분류는 남아야 함: %s", raw)
+	}
+	logged, _ := os.ReadFile(logPath)
+	if !strings.Contains(string(logged), "gpu-node-07") || !strings.Contains(string(logged), "127.0.0.1:1") {
+		t.Fatalf("서버 로그에는 원문이 남아야 함: %s", logged)
+	}
+}
+
+func TestMetaHeaders(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "ok") })
+	good := sseFake(t, false)
+	p := prov(f.srv.URL)
+	p.Mask = true
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": p, "s": prov(good.srv.URL), "down": prov("http://127.0.0.1:1")},
+		Routes: map[string]*RouteConfig{
+			"r":  {Steps: []StepConfig{{Provider: "a"}}},
+			"st": {Steps: []StepConfig{{Provider: "down"}, {Provider: "s"}}},
+		},
+	})
+	s := serve(t, g)
+	resp, err := http.Post(s.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"r","messages":[{"role":"user","content":"메일 a@b.com"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if h := resp.Header; h.Get("X-LLMGW-Provider") != "a" || h.Get("X-LLMGW-Model") != "m" || h.Get("X-LLMGW-Attempts") != "1" || h.Get("X-LLMGW-Masked") != "1" {
+		t.Fatalf("headers %v", resp.Header)
+	}
+	resp, err = http.Post(s.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"st","stream":true,"messages":[{"role":"user","content":"x"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if h := resp.Header; h.Get("X-LLMGW-Provider") != "s" || h.Get("X-LLMGW-Attempts") != "2" {
+		t.Fatalf("스트림 응답도 헤더로 처리 provider 를 알려야 함: %v", resp.Header)
+	}
+}
+
+func TestStreamIdleTimeout(t *testing.T) {
+	// 줄 간격이 idle 보다 짧으면 전체 길이가 timeout 을 넘어도 끝까지 받는다.
+	steady := newFake(t, func(_ int64, w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		for range 6 {
+			fmt.Fprint(w, "data: {}\n\n")
+			w.(http.Flusher).Flush()
+			time.Sleep(50 * time.Millisecond)
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	})
+	// 첫 줄 뒤 멈추면 idle 타임아웃으로 끊는다.
+	stall := newFake(t, func(_ int64, w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {}\n\n")
+		w.(http.Flusher).Flush()
+		time.Sleep(2 * time.Second)
+	})
+	mk := func(url string) *ProviderConfig {
+		p := prov(url)
+		p.Timeout, p.StreamIdleTimeout = Duration{200 * time.Millisecond}, Duration{150 * time.Millisecond}
+		return p
+	}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"steady": mk(steady.srv.URL), "stall": mk(stall.srv.URL)},
+		Routes: map[string]*RouteConfig{
+			"steady": {Steps: []StepConfig{{Provider: "steady"}}},
+			"stall":  {Steps: []StepConfig{{Provider: "stall"}}},
+		},
+	})
+	var lines int
+	if _, err := g.Stream(context.Background(), userReq("steady", "x"), func([]byte) error { lines++; return nil }); err != nil {
+		t.Fatalf("전체 300ms+ 스트림이 timeout(200ms)에 잘리면 안 됨: %v", err)
+	}
+	t0 := time.Now()
+	resp, err := g.Stream(context.Background(), userReq("stall", "x"), func([]byte) error { return nil })
+	if err == nil || time.Since(t0) > time.Second {
+		t.Fatalf("멈춘 스트림은 idle 타임아웃으로 빨리 끊어야 함: err=%v %s", err, time.Since(t0))
+	}
+	if a := resp.Attempts[len(resp.Attempts)-1]; a.Error != "스트림 idle 타임아웃" {
+		t.Fatalf("attempt %+v", a)
+	}
+	if lines < 7 {
+		t.Fatalf("steady 줄 수 %d", lines)
+	}
+}
+
+func TestStreamErrorAfterStartIsSanitized(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: {}\n\n")
+		w.(http.Flusher).Flush()
+		conn, _, _ := w.(http.Hijacker).Hijack() // 스트림 도중 연결을 끊는다
+		conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	resp, err := g.Stream(context.Background(), userReq("r", "x"), func([]byte) error { return nil })
+	if err == nil || err.Error() != "스트림 중단(a): 스트림 읽기 실패" {
+		t.Fatalf("시작 뒤 에러도 분류만 돌려줘야 함: %v", err)
+	}
+	if a := resp.Attempts[0]; a.Detail == "" || !strings.Contains(a.Detail, "스트림 읽기:") {
+		t.Fatalf("원문은 Detail 에 남아야 함: %+v", a)
+	}
+}
+
+func TestPassthroughTimeoutClassified(t *testing.T) {
+	slow := newFake(t, func(_ int64, w http.ResponseWriter) { time.Sleep(300 * time.Millisecond) })
+	p := prov(slow.srv.URL)
+	p.Passthrough, p.Timeout = true, Duration{50 * time.Millisecond}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": p},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	s := serve(t, g)
+	code, out := post(t, s.URL+"/passthrough/a/parse", "", `{}`)
+	if msg := out["error"].(map[string]any)["message"]; code != 502 || msg != "타임아웃" {
+		t.Fatalf("passthrough 타임아웃은 타임아웃으로 분류해야 함: %d %v", code, msg)
 	}
 }

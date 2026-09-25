@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
+	"sync/atomic"
 	"time"
 )
 
@@ -16,6 +18,12 @@ import (
 // 같은 규칙으로 재시도·폴백하고, 스트림이 시작되면 그 provider 의 SSE 줄을 onLine 으로 그대로 넘긴다.
 // 스트림 도중 끊기면 다른 provider 로 이어붙이지 않는다(부분 응답을 섞지 않기 위해). 검증·캐시는 하지 않는다.
 func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) error) (resp *Response, err error) {
+	return g.StreamWithStart(ctx, req, nil, onLine)
+}
+
+// StreamWithStart 는 Stream 과 같고, 스트림이 시작될 때(첫 줄을 넘기기 직전) onStart 를 한 번 부른다.
+// onStart 는 처리할 provider·모델과 그때까지의 시도 기록을 받는다(응답 헤더를 쓰는 데 쓴다).
+func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func(*Response), onLine func([]byte) error) (resp *Response, err error) {
 	start := time.Now()
 	defer func() { g.record(req, resp, err, time.Since(start)) }()
 
@@ -56,11 +64,12 @@ func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) e
 			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: ErrExternalBlocked.Error()})
 			continue
 		}
+		masked := g.maskBody(p, body)
 		for try := 0; ; try++ {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning}
+			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
 			release, err := gt.acquire(ctx)
 			a.WaitedMS = time.Since(t0).Milliseconds()
@@ -73,28 +82,42 @@ func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) e
 				break
 			}
 			t1 := time.Now()
-			started, err := doStream(ctx, g.hc, p, g.keys[s.Provider], body, onLine)
+			first := true
+			started, err := doStream(ctx, g.hc, p, g.keys[s.Provider], body, func(line []byte) error {
+				if first {
+					first = false
+					if onStart != nil {
+						onStart(&Response{Provider: s.Provider, Model: model, Attempts: append(slices.Clone(attempts), a)})
+					}
+				}
+				return onLine(line)
+			})
 			release()
 			a.LatencyMS = time.Since(t1).Milliseconds()
 			if started {
 				// 스트림이 시작된 뒤의 에러는 폴백하지 않고 그대로 돌려준다.
 				// 호출자 취소·전달 실패(onLine 에러)는 provider 실패로 세지 않는다.
 				var ce *callError
+				errors.As(err, &ce)
 				switch {
 				case err == nil:
 					gt.report(true)
-				case ctx.Err() == nil && errors.As(err, &ce):
+				case ctx.Err() == nil && ce != nil:
 					gt.report(false)
 				default:
 					gt.reportNeutral()
 				}
 				if err != nil {
-					a.Error = err.Error()
+					a.setError(err)
 				}
 				attempts = append(attempts, a)
 				r := &Response{Provider: s.Provider, Model: model, Attempts: attempts, Latency: Duration{time.Since(start)}}
 				if err != nil {
-					return r, fmt.Errorf("스트림 중단(%s): %w", s.Provider, err)
+					// 호출자에게는 분류만 준다. upstream 원문은 Attempt.Detail 에 남아 있다.
+					if ce != nil {
+						return r, fmt.Errorf("스트림 중단(%s): %s", s.Provider, ce.public())
+					}
+					return r, fmt.Errorf("스트림 중단(%s): %w", s.Provider, err) // onLine 이 돌려준 호출자 쪽 에러
 				}
 				return r, nil
 			}
@@ -108,10 +131,7 @@ func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) e
 			} else {
 				gt.report(false)
 			}
-			a.Error = err.Error()
-			if ce != nil {
-				a.Status = ce.status
-			}
+			a.setError(err)
 			attempts = append(attempts, a)
 			if ce == nil || !ce.retryable || try >= s.Retries {
 				break
@@ -135,16 +155,22 @@ func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) e
 }
 
 // doStream 은 stream:true 로 호출한다. 200 을 받아 첫 줄을 넘기기 시작하면 started=true.
-func doStream(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey string, body map[string]any, onLine func([]byte) error) (started bool, err error) {
+// 응답 헤더를 받을 때까지는 provider timeout, 그 뒤로는 줄 사이 간격에 stream_idle_timeout 을 적용한다.
+// 스트림 전체 길이에는 제한을 두지 않는다(긴 추론 응답이 중간에 잘리지 않게).
+func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey string, body map[string]any, onLine func([]byte) error) (started bool, err error) {
 	b, err := json.Marshal(body)
 	if err != nil {
-		return false, &callError{msg: "요청 직렬화: " + err.Error()}
+		return false, &callError{msg: "요청 직렬화: " + err.Error(), kind: "요청 직렬화 실패"}
 	}
-	ctx, cancel := context.WithTimeout(ctx, p.Timeout.Duration)
+	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(p.Timeout.Duration, func() { timedOut.Store(true); cancel() })
+	defer timer.Stop()
+
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(b))
 	if err != nil {
-		return false, &callError{msg: err.Error()}
+		return false, &callError{msg: err.Error(), kind: "요청 생성 실패"}
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	hreq.Header.Set("Accept", "text/event-stream")
@@ -153,7 +179,7 @@ func doStream(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey st
 	}
 	resp, err := hc.Do(hreq)
 	if err != nil {
-		return false, &callError{msg: err.Error(), retryable: !errors.Is(ctx.Err(), context.Canceled)}
+		return false, transportError(err, timedOut.Load(), parent.Err() == nil)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -165,10 +191,13 @@ func doStream(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey st
 			msg:        truncate(string(raw), 300),
 		}
 	}
+	idle := p.StreamIdleTimeout.Duration
+	timer.Reset(idle)
 	rd := bufio.NewReaderSize(resp.Body, 64<<10)
 	for {
 		line, rerr := rd.ReadBytes('\n')
 		if len(line) > 0 {
+			timer.Reset(idle)
 			started = true
 			if err := onLine(line); err != nil {
 				return true, err
@@ -176,12 +205,15 @@ func doStream(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey st
 		}
 		if rerr == io.EOF {
 			if !started {
-				return false, &callError{msg: "빈 스트림", retryable: true}
+				return false, &callError{msg: "빈 스트림", kind: "빈 스트림", retryable: true}
 			}
 			return true, nil
 		}
 		if rerr != nil {
-			return started, &callError{msg: "스트림 읽기: " + rerr.Error(), retryable: !started}
+			if timedOut.Load() {
+				return started, &callError{msg: fmt.Sprintf("스트림 %s 동안 응답 없음", idle), kind: "스트림 idle 타임아웃", retryable: !started}
+			}
+			return started, &callError{msg: "스트림 읽기: " + rerr.Error(), kind: "스트림 읽기 실패", retryable: !started}
 		}
 	}
 }

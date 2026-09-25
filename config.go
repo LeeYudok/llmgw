@@ -26,6 +26,16 @@ type Config struct {
 	// LogPath 에 요청 1건당 JSONL 한 줄(클라이언트·라우트·처리 provider·지연·토큰·에러)을 남긴다.
 	// 프롬프트·응답 본문은 남기지 않는다. 비우면 기록하지 않는다.
 	LogPath string `toml:"log_path" yaml:"log_path"`
+	// Mask 는 provider 로 보내기 전에 프롬프트의 개인정보·비밀값을 가리는 규칙이다.
+	Mask MaskConfig `toml:"mask" yaml:"mask"`
+}
+
+// MaskConfig 는 프롬프트 마스킹 규칙이다. 가린 값은 [REDACTED:<종류>] 로 바뀌고 원문은 어디에도 남지 않는다.
+// passthrough 요청 본문(파일 등)은 형식을 알 수 없어 가리지 않는다.
+type MaskConfig struct {
+	External bool              `toml:"external" yaml:"external"` // external provider 로 보내는 요청을 가린다
+	Kinds    []string          `toml:"kinds" yaml:"kinds"`       // 쓸 기본 패턴(rrn, card, phone, account, email, secret). 비우면 전부
+	Custom   map[string]string `toml:"custom" yaml:"custom"`     // 추가 패턴: 이름 → 정규식(RE2)
 }
 
 // ProviderConfig 는 OpenAI 호환 엔드포인트 하나와 그 트래픽 제어값이다.
@@ -60,6 +70,11 @@ type ProviderConfig struct {
 	Passthrough bool `toml:"passthrough" yaml:"passthrough"`
 	// External — 조직 밖으로 데이터가 나가는 provider(외부 API). 외부 차단 요청·클라이언트는 이 step 을 건너뛴다.
 	External bool `toml:"external" yaml:"external"`
+	// Mask — true 면 external 여부와 상관없이 이 provider 로 보내는 요청을 mask 규칙으로 가린다.
+	Mask bool `toml:"mask" yaml:"mask"`
+	// StreamIdleTimeout — 스트림이 시작된 뒤 이 시간 동안 새 줄이 오지 않으면 끊는다(기본 60s).
+	// timeout 은 스트림에서는 응답 헤더를 받을 때까지만 적용된다.
+	StreamIdleTimeout Duration `toml:"stream_idle_timeout" yaml:"stream_idle_timeout"`
 
 	Extra map[string]any `toml:"extra" yaml:"extra"` // 요청 body 에 그대로 합칠 추가 필드
 }
@@ -193,6 +208,9 @@ func (c *Config) applyDefaults() {
 		if p.BreakerCooldown.Duration == 0 {
 			p.BreakerCooldown.Duration = 30 * time.Second
 		}
+		if p.StreamIdleTimeout.Duration == 0 {
+			p.StreamIdleTimeout.Duration = 60 * time.Second
+		}
 	}
 	for _, cl := range c.Clients {
 		if cl.QueueTimeout.Duration == 0 {
@@ -249,6 +267,18 @@ func (c *Config) validate() error {
 				errs = append(errs, fmt.Errorf("route %s step %d: reasoning %q (off|on|low|medium|high|inherit)", name, i, s.Reasoning))
 			}
 		}
+	}
+	known := map[string]bool{}
+	for _, k := range MaskKinds() {
+		known[k] = true
+	}
+	for _, k := range c.Mask.Kinds {
+		if !known[k] {
+			errs = append(errs, fmt.Errorf("mask.kinds: %q (%s)", k, strings.Join(MaskKinds(), "|")))
+		}
+	}
+	if _, err := newMasker(c.Mask); err != nil {
+		errs = append(errs, err)
 	}
 	for name, cl := range c.Clients {
 		if cl.APIKeyEnv == "" {
