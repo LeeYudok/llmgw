@@ -326,6 +326,10 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			continue
 		}
 		masked := g.maskBody(p, body)
+		if why := g.autoSpill(route, i, req.NoExternal); why != "" {
+			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: why})
+			continue
+		}
 
 		for try := 0; ; try++ {
 			if err := ctx.Err(); err != nil {
@@ -333,7 +337,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquire(ctx)
+			release, err := gt.acquireWithin(ctx, stepMaxWait(route, i))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -360,6 +364,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					break // 같은 설정으로 다시 불러도 같은 결과일 가능성이 커서 다음 step 으로
 				}
 				gt.report(true)
+				gt.lat.observe(time.Since(t1))
 				attempts = append(attempts, a)
 				if c.model == "" {
 					c.model = model
@@ -414,6 +419,40 @@ func (g *Gateway) maskBody(p *ProviderConfig, body map[string]any) int {
 	return n
 }
 
+// autoSpill 은 step i 가 spill=auto 일 때, 다음으로 시도할 step 에서 처리하는 편이 빨리 끝날 것으로 보이면
+// 그 사유를 돌려준다(아니면 ""). 다음 step 은 외부 차단으로 건너뛸 step 을 뺀 첫 step 이다.
+func (g *Gateway) autoSpill(route *RouteConfig, i int, noExternal bool) string {
+	if route.Steps[i].Spill != "auto" {
+		return ""
+	}
+	for j := i + 1; j < len(route.Steps); j++ {
+		np := g.cfg.Providers[route.Steps[j].Provider]
+		if np.External && noExternal {
+			continue
+		}
+		ng := g.gates[route.Steps[j].Provider]
+		if !ng.admits() {
+			return "" // 넘겨 봐야 바로 거절될 곳이면 여기서 기다린다
+		}
+		here, ok1 := g.gates[route.Steps[i].Provider].expectedFinish()
+		next, ok2 := ng.expectedFinish()
+		if ok1 && ok2 && here > next {
+			g.gates[route.Steps[i].Provider].stats.EarlySpills.Add(1)
+			return fmt.Sprintf("%s: 예상 완료 %s > %s %s", ErrWaitTooLong, here.Round(time.Millisecond), route.Steps[j].Provider, next.Round(time.Millisecond))
+		}
+		return ""
+	}
+	return ""
+}
+
+// stepMaxWait 는 i 번째 step 의 max_wait 다. 마지막 step 은 넘길 곳이 없으므로 적용하지 않는다.
+func stepMaxWait(route *RouteConfig, i int) time.Duration {
+	if i == len(route.Steps)-1 {
+		return 0
+	}
+	return route.Steps[i].MaxWait.Duration
+}
+
 // backoff 는 0.5s·1s·2s… 지수 증가에 0~250ms 지터를 더한다(최대 8s).
 func backoff(try int) time.Duration {
 	d := min(500*time.Millisecond<<try, 8*time.Second)
@@ -449,18 +488,24 @@ func requestKey(req Request) string {
 // ProviderStat 은 프로바이더별 누적·현재 상태다.
 type ProviderStat struct {
 	Calls, OK, Fail, QueueRejects, QueueTimeouts, BreakerSkips int64
+	EarlySpills                                                int64 // 예상 대기가 max_wait 를 넘어 바로 다음 step 으로 넘긴 수
 	InFlight, Waiting                                          int64
+	LatencyP50MS, LatencyP95MS                                 int64 // 최근 성공 호출 256건의 소요 시간
+	EstWaitMS                                                  int64 // 지금 들어오면 예상되는 대기 시간
 }
 
 // Stats 는 프로바이더별 상태 스냅샷을 돌려준다.
 func (g *Gateway) Stats() map[string]ProviderStat {
 	out := make(map[string]ProviderStat, len(g.gates))
 	for name, gt := range g.gates {
+		p50, p95 := gt.lat.percentiles()
 		out[name] = ProviderStat{
 			Calls: gt.stats.Calls.Load(), OK: gt.stats.OK.Load(), Fail: gt.stats.Fail.Load(),
 			QueueRejects: gt.stats.QueueRejects.Load(), QueueTimeouts: gt.stats.QueueTimeouts.Load(),
-			BreakerSkips: gt.stats.BreakerSkips.Load(),
-			InFlight:     gt.inFlight.Load(), Waiting: gt.waiting.Load(),
+			BreakerSkips: gt.stats.BreakerSkips.Load(), EarlySpills: gt.stats.EarlySpills.Load(),
+			InFlight: gt.inFlight.Load(), Waiting: gt.waiting.Load(),
+			LatencyP50MS: p50.Milliseconds(), LatencyP95MS: p95.Milliseconds(),
+			EstWaitMS: gt.estimateWait().Milliseconds(),
 		}
 	}
 	return out

@@ -3,6 +3,8 @@ package llmgw
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -13,6 +15,8 @@ var (
 	ErrQueueFull    = errors.New("대기열 가득 참")
 	ErrQueueTimeout = errors.New("대기열 대기 시간 초과")
 	ErrBreakerOpen  = errors.New("서킷 브레이커 열림")
+	// ErrWaitTooLong 은 예상 대기 시간이 step 의 max_wait 를 넘어 기다리지 않고 넘긴 경우다.
+	ErrWaitTooLong = errors.New("예상 대기 초과")
 )
 
 // gate 는 프로바이더 하나의 입구다. 들어오는 순서대로 ①대기열 자리 ②동시 처리 슬롯 ③분당 한도 토큰을
@@ -33,12 +37,57 @@ type gate struct {
 	openUntil       time.Time
 
 	waiting  atomic.Int64
+	blocked  atomic.Int64 // 동시 처리 슬롯을 기다리는 요청 수(waiting 의 일부)
 	inFlight atomic.Int64
 	stats    providerStats
+	lat      latencyWindow
 }
 
 type providerStats struct {
-	Calls, OK, Fail, QueueRejects, QueueTimeouts, BreakerSkips atomic.Int64
+	Calls, OK, Fail, QueueRejects, QueueTimeouts, BreakerSkips, EarlySpills atomic.Int64
+}
+
+// latencyWindow 는 최근 호출 소요 시간을 고정 크기 링 버퍼에 담는다(대기 예측·통계용).
+type latencyWindow struct {
+	mu   sync.Mutex
+	buf  [256]time.Duration
+	n    int // 채워진 칸 수
+	next int
+	sum  time.Duration
+}
+
+func (w *latencyWindow) observe(d time.Duration) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.n == len(w.buf) {
+		w.sum -= w.buf[w.next]
+	} else {
+		w.n++
+	}
+	w.buf[w.next] = d
+	w.sum += d
+	w.next = (w.next + 1) % len(w.buf)
+}
+
+func (w *latencyWindow) mean() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.n == 0 {
+		return 0
+	}
+	return w.sum / time.Duration(w.n)
+}
+
+// percentiles 는 최근 호출의 p50·p95 다. 기록이 없으면 0.
+func (w *latencyWindow) percentiles() (p50, p95 time.Duration) {
+	w.mu.Lock()
+	s := slices.Clone(w.buf[:w.n])
+	w.mu.Unlock()
+	if len(s) == 0 {
+		return 0, 0
+	}
+	slices.Sort(s)
+	return s[(len(s)-1)*50/100], s[(len(s)-1)*95/100]
 }
 
 func newGate(p *ProviderConfig) *gate {
@@ -59,6 +108,12 @@ func newGate(p *ProviderConfig) *gate {
 
 // acquire 는 호출 자격을 얻을 때까지 기다린다. 성공하면 release 를 반드시 호출해야 한다.
 func (g *gate) acquire(ctx context.Context) (release func(), err error) {
+	return g.acquireWithin(ctx, 0)
+}
+
+// acquireWithin 은 acquire 와 같되, maxWait(>0)이 있으면 예상 대기가 그보다 길 때 기다리지 않고 바로
+// ErrWaitTooLong 을 돌려주고, 실제 대기도 maxWait 로 자른다(queue_timeout 이 더 짧으면 그쪽).
+func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (release func(), err error) {
 	if g.breakerOpen() {
 		g.stats.BreakerSkips.Add(1)
 		return nil, ErrBreakerOpen
@@ -67,16 +122,29 @@ func (g *gate) acquire(ctx context.Context) (release func(), err error) {
 		g.stats.QueueRejects.Add(1)
 		return nil, ErrQueueFull
 	}
+	if maxWait > 0 {
+		if est := g.estimateWait(); est > maxWait {
+			g.stats.EarlySpills.Add(1)
+			return nil, fmt.Errorf("%w: 예상 %s > max_wait %s", ErrWaitTooLong, est.Round(time.Millisecond), maxWait)
+		}
+	}
 	g.waiting.Add(1)
 	defer g.waiting.Add(-1)
 
-	wctx, cancel := context.WithTimeout(ctx, g.queueTimeout)
+	timeout := g.queueTimeout
+	if maxWait > 0 && maxWait < timeout {
+		timeout = maxWait
+	}
+	wctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	if g.slots != nil {
+		g.blocked.Add(1)
 		select {
 		case g.slots <- struct{}{}:
+			g.blocked.Add(-1)
 		case <-wctx.Done():
+			g.blocked.Add(-1)
 			return nil, g.waitErr(ctx)
 		}
 	}
@@ -98,6 +166,46 @@ func (g *gate) acquire(ctx context.Context) (release func(), err error) {
 			releaseSlot()
 		})
 	}, nil
+}
+
+// estimateWait 는 지금 들어온 요청이 호출을 시작하기까지 기다릴 시간을 어림한다.
+//   - 분당 한도: 이미 예약된 다음 발송 시각까지 + 슬롯을 기다리는 요청 수 × 요청 간격
+//   - 동시 처리: 앞에 밀린 요청 수 ÷ 동시 처리 수 × 최근 평균 소요 시간(기록이 없으면 0 으로 본다)
+//
+// 둘 중 긴 쪽을 쓴다. 정확한 값이 아니라 "기다려 봐야 소용없다"를 미리 알아채는 용도다.
+func (g *gate) estimateWait() time.Duration {
+	var d time.Duration
+	blocked := g.blocked.Load()
+	if g.interval > 0 {
+		g.mu.Lock()
+		r := time.Until(g.next)
+		g.mu.Unlock()
+		d = max(r, 0) + time.Duration(blocked)*g.interval
+	}
+	if g.slots != nil {
+		c := int64(cap(g.slots))
+		if ahead := int64(len(g.slots)) + blocked + 1 - c; ahead > 0 {
+			if avg := g.lat.mean(); avg > 0 {
+				d = max(d, time.Duration(ahead)*avg/time.Duration(c))
+			}
+		}
+	}
+	return d
+}
+
+// admits 는 지금 요청을 받을 수 있는 상태인지다(브레이커가 닫혀 있고 대기열에 자리가 있다).
+func (g *gate) admits() bool {
+	return !g.breakerOpen() && (g.maxQueue == 0 || g.waiting.Load() < int64(g.maxQueue))
+}
+
+// expectedFinish 는 지금 들어온 요청이 끝날 때까지의 예상 시간(대기 + 최근 평균 소요)이다.
+// 소요 시간 기록이 없으면 ok=false.
+func (g *gate) expectedFinish() (d time.Duration, ok bool) {
+	avg := g.lat.mean()
+	if avg == 0 {
+		return 0, false
+	}
+	return g.estimateWait() + avg, true
 }
 
 // waitErr 는 대기 중단 사유를 가른다: 호출자 ctx 가 끝났으면 그 에러, 아니면 대기열 시간 초과.

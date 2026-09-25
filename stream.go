@@ -65,13 +65,17 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 			continue
 		}
 		masked := g.maskBody(p, body)
+		if why := g.autoSpill(route, i, req.NoExternal); why != "" {
+			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: why})
+			continue
+		}
 		for try := 0; ; try++ {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquire(ctx)
+			release, err := gt.acquireWithin(ctx, stepMaxWait(route, i))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -102,6 +106,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				switch {
 				case err == nil:
 					gt.report(true)
+					gt.lat.observe(time.Since(t1))
 				case ctx.Err() == nil && ce != nil:
 					gt.report(false)
 				default:
