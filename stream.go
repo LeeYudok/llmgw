@@ -59,6 +59,9 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 		gt := g.gates[s.Provider]
 		body := buildBody(p, s, &req)
 		body["stream"] = true
+		if p.StreamUsage {
+			body["stream_options"] = map[string]any{"include_usage": true}
+		}
 		model, _ := body["model"].(string)
 		if p.External && req.NoExternal {
 			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: ErrExternalBlocked.Error()})
@@ -75,7 +78,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
+			pm, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -87,7 +90,11 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 			}
 			t1 := time.Now()
 			first := true
+			var usage Usage
 			started, err := doStream(ctx, g.hc, p, g.keys[s.Provider], body, func(line []byte) error {
+				if u, ok := usageFromSSE(line); ok {
+					usage = u
+				}
 				if first {
 					first = false
 					if onStart != nil {
@@ -96,7 +103,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				}
 				return onLine(line)
 			})
-			release()
+			pm.release()
 			a.LatencyMS = time.Since(t1).Milliseconds()
 			if started {
 				// 스트림이 시작된 뒤의 에러는 폴백하지 않고 그대로 돌려준다.
@@ -105,18 +112,18 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				errors.As(err, &ce)
 				switch {
 				case err == nil:
-					gt.report(true)
+					pm.report(true)
 					gt.lat.observe(time.Since(t1))
 				case ctx.Err() == nil && ce != nil:
-					gt.report(false)
+					pm.report(false)
 				default:
-					gt.reportNeutral()
+					pm.reportNeutral()
 				}
 				if err != nil {
 					a.setError(err)
 				}
 				attempts = append(attempts, a)
-				r := &Response{Provider: s.Provider, Model: model, Attempts: attempts, Latency: Duration{time.Since(start)}}
+				r := &Response{Provider: s.Provider, Model: model, Usage: usage, Attempts: attempts, Latency: Duration{time.Since(start)}}
 				if err != nil {
 					// 호출자에게는 분류만 준다. upstream 원문은 Attempt.Detail 에 남아 있다.
 					if ce != nil {
@@ -127,14 +134,15 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				return r, nil
 			}
 			if ctx.Err() != nil {
+				pm.abandon() // 시험 요청이 취소로 끝났으면 자리를 돌려준다
 				return nil, ctx.Err()
 			}
 			var ce *callError
 			errors.As(err, &ce)
 			if ce != nil && !ce.providerFault() {
-				gt.reportNeutral()
+				pm.reportNeutral()
 			} else {
-				gt.report(false)
+				pm.report(false)
 			}
 			a.setError(err)
 			attempts = append(attempts, a)
@@ -157,6 +165,46 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 		}
 	}
 	return nil, &ChainError{Attempts: attempts}
+}
+
+var errLineTooLong = errors.New("줄이 너무 김")
+
+// readLine 은 줄바꿈까지 읽되 limit 바이트를 넘으면 errLineTooLong 을 돌려준다.
+// bufio.ReadBytes 는 줄바꿈이 올 때까지 끝없이 버퍼를 늘리므로, 줄바꿈 없이 큰 데이터가 오면 메모리를 다 쓴다.
+func readLine(rd *bufio.Reader, limit int) ([]byte, error) {
+	var line []byte
+	for {
+		chunk, err := rd.ReadSlice('\n')
+		if len(line)+len(chunk) > limit {
+			return nil, errLineTooLong
+		}
+		line = append(line, chunk...)
+		if err != bufio.ErrBufferFull {
+			return line, err
+		}
+	}
+}
+
+// usageFromSSE 는 SSE 한 줄에 usage 가 실려 있으면 꺼낸다(stream_options.include_usage 의 마지막 청크 등).
+func usageFromSSE(line []byte) (Usage, bool) {
+	data, ok := bytes.CutPrefix(bytes.TrimSpace(line), []byte("data:"))
+	if !ok || !bytes.Contains(data, []byte(`"usage"`)) {
+		return Usage{}, false
+	}
+	var c struct {
+		Usage *struct {
+			PromptTokens            int `json:"prompt_tokens"`
+			CompletionTokens        int `json:"completion_tokens"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
+		} `json:"usage"`
+	}
+	if json.Unmarshal(bytes.TrimSpace(data), &c) != nil || c.Usage == nil {
+		return Usage{}, false
+	}
+	return Usage{PromptTokens: c.Usage.PromptTokens, CompletionTokens: c.Usage.CompletionTokens,
+		ReasoningTokens: c.Usage.CompletionTokensDetails.ReasoningTokens}, true
 }
 
 // doStream 은 stream:true 로 호출한다. 200 을 받아 첫 줄을 넘기기 시작하면 started=true.
@@ -188,7 +236,7 @@ func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		return false, &callError{
 			status:     resp.StatusCode,
 			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
@@ -200,19 +248,23 @@ func doStream(parent context.Context, hc *http.Client, p *ProviderConfig, apiKey
 	timer.Reset(idle)
 	rd := bufio.NewReaderSize(resp.Body, 64<<10)
 	for {
-		line, rerr := rd.ReadBytes('\n')
+		line, rerr := readLine(rd, int(p.MaxResponseBytes))
 		if len(line) > 0 {
-			timer.Reset(idle)
 			started = true
+			timer.Stop() // 호출자에게 넘기는 동안은 idle 로 세지 않는다(느린 호출자 탓을 provider 에 돌리지 않게)
 			if err := onLine(line); err != nil {
 				return true, err
 			}
+			timer.Reset(idle)
 		}
 		if rerr == io.EOF {
 			if !started {
 				return false, &callError{msg: "빈 스트림", kind: "빈 스트림", retryable: true}
 			}
 			return true, nil
+		}
+		if rerr == errLineTooLong {
+			return started, &callError{msg: fmt.Sprintf("스트림 한 줄이 max_response_bytes(%d) 초과", p.MaxResponseBytes), kind: "스트림 줄이 너무 김", retryable: !started}
 		}
 		if rerr != nil {
 			if timedOut.Load() {

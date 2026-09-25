@@ -34,7 +34,10 @@ type gate struct {
 	breakerFailures int
 	breakerCooldown time.Duration
 	consecFail      int
-	openUntil       time.Time
+	tripped         bool      // 브레이커가 열린 적이 있고 아직 성공으로 닫히지 않았다
+	openUntil       time.Time // 이 시각까지는 모두 막는다
+	probeUntil      time.Time // half-open 시험 요청이 진행 중인 동안 다른 요청을 막는다
+	probeGen        uint64    // 시험 요청 세대. 시험 자리를 줄 때마다 1 씩 늘린다
 
 	waiting  atomic.Int64
 	blocked  atomic.Int64 // 동시 처리 슬롯을 기다리는 요청 수(waiting 의 일부)
@@ -106,17 +109,55 @@ func newGate(p *ProviderConfig) *gate {
 	return g
 }
 
+// permit 은 게이트를 통과한 요청 한 건의 자격이다. 호출이 끝나면 release 하고, 결과는 report 로 알린다.
+// probe 는 half-open 시험 요청의 세대 번호다(0 이면 시험 요청이 아님). 브레이커는 지금 세대의 시험 요청
+// 결과만 받는다 — 쿨다운보다 오래 걸린 옛 시험 요청의 결과가 새 시험 요청의 판정을 뒤집지 않게.
+type permit struct {
+	g     *gate
+	probe uint64
+	once  sync.Once
+}
+
+func (p *permit) release() {
+	p.once.Do(func() {
+		p.g.inFlight.Add(-1)
+		if p.g.slots != nil {
+			<-p.g.slots
+		}
+	})
+}
+
+func (p *permit) report(ok bool) { p.g.report(ok, p.probe) }
+func (p *permit) reportNeutral() { p.g.reportNeutral(p.probe) }
+
+// abandon 은 호출자가 취소해 판정 없이 끝난 요청이다. 통계에는 남기지 않고, 시험 요청이었다면 자리만 돌려준다.
+func (p *permit) abandon() { p.g.releaseProbe(p.probe) }
+
 // acquire 는 호출 자격을 얻을 때까지 기다린다. 성공하면 release 를 반드시 호출해야 한다.
+// 결과를 브레이커에 알리지 않는 곳(client 게이트)에서 쓴다.
 func (g *gate) acquire(ctx context.Context) (release func(), err error) {
-	return g.acquireWithin(ctx, 0)
+	pm, err := g.acquireWithin(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	return pm.release, nil
 }
 
 // acquireWithin 은 acquire 와 같되, maxWait(>0)이 있으면 예상 대기가 그보다 길 때 기다리지 않고 바로
 // ErrWaitTooLong 을 돌려주고, 실제 대기도 maxWait 로 자른다(queue_timeout 이 더 짧으면 그쪽).
-func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (release func(), err error) {
-	if g.breakerOpen() {
+func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (pm *permit, err error) {
+	admit, probe := g.breakerAdmit()
+	if !admit {
 		g.stats.BreakerSkips.Add(1)
 		return nil, ErrBreakerOpen
+	}
+	if probe != 0 {
+		// 시험 자리를 얻었는데 호출까지 못 가면(대기열·max_wait·시간 초과) 자리를 돌려준다.
+		defer func() {
+			if err != nil {
+				g.releaseProbe(probe)
+			}
+		}()
 	}
 	if g.maxQueue > 0 && g.waiting.Load() >= int64(g.maxQueue) {
 		g.stats.QueueRejects.Add(1)
@@ -156,24 +197,15 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 			return nil, stop()
 		}
 	}
-	releaseSlot := func() {
+	if err := g.waitRate(wctx); err != nil {
 		if g.slots != nil {
 			<-g.slots
 		}
-	}
-	if err := g.waitRate(wctx); err != nil {
-		releaseSlot()
 		return nil, stop()
 	}
 	g.inFlight.Add(1)
 	g.stats.Calls.Add(1)
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			g.inFlight.Add(-1)
-			releaseSlot()
-		})
-	}, nil
+	return &permit{g: g, probe: probe}, nil
 }
 
 // estimateWait 는 지금 들어온 요청이 호출을 시작하기까지 기다릴 시간을 어림한다.
@@ -184,12 +216,10 @@ func (g *gate) acquireWithin(ctx context.Context, maxWait time.Duration) (releas
 func (g *gate) estimateWait() time.Duration {
 	var d time.Duration
 	blocked := g.blocked.Load()
-	if g.interval > 0 {
-		g.mu.Lock()
-		r := time.Until(g.next)
-		g.mu.Unlock()
-		d = max(r, 0) + time.Duration(blocked)*g.interval
-	}
+	g.mu.Lock()
+	r := time.Until(g.next) // 분당 한도 예약, 또는 429 Retry-After 로 밀린 시각
+	g.mu.Unlock()
+	d = max(r, 0) + time.Duration(blocked)*g.interval
 	if g.slots != nil {
 		c := int64(cap(g.slots))
 		if ahead := int64(len(g.slots)) + blocked + 1 - c; ahead > 0 {
@@ -203,7 +233,7 @@ func (g *gate) estimateWait() time.Duration {
 
 // admits 는 지금 요청을 받을 수 있는 상태인지다(브레이커가 닫혀 있고 대기열에 자리가 있다).
 func (g *gate) admits() bool {
-	return !g.breakerOpen() && (g.maxQueue == 0 || g.waiting.Load() < int64(g.maxQueue))
+	return !g.breakerBlocked() && (g.maxQueue == 0 || g.waiting.Load() < int64(g.maxQueue))
 }
 
 // expectedFinish 는 지금 들어온 요청이 끝날 때까지의 예상 시간(대기 + 최근 평균 소요)이다.
@@ -225,18 +255,26 @@ func (g *gate) waitErr(ctx context.Context) error {
 	return ErrQueueTimeout
 }
 
+// errRateBeyondDeadline 은 분당 한도 자리가 대기 마감보다 뒤라서 예약하지 않았다는 뜻이다.
+var errRateBeyondDeadline = errors.New("분당 한도 자리가 대기 마감 뒤")
+
 // waitRate 는 분당 한도를 요청 간 고정 간격으로 지킨다(버스트 없음). 자리를 먼저 예약하고 그 시각까지 잔다.
+// rpm 이 없어도 429 Retry-After 로 밀린 시각(next)까지는 기다린다. 예약할 자리가 대기 마감(ctx deadline)보다
+// 뒤면 예약하지 않고 바로 돌려준다 — 기다려도 못 쓸 자리를 붙잡아 뒤 요청을 막지 않기 위해서다.
 func (g *gate) waitRate(ctx context.Context) error {
-	if g.interval == 0 {
-		return nil
-	}
 	g.mu.Lock()
 	now := time.Now()
 	at := g.next
 	if at.Before(now) {
 		at = now
 	}
-	g.next = at.Add(g.interval)
+	if dl, ok := ctx.Deadline(); ok && at.After(dl) {
+		g.mu.Unlock()
+		return errRateBeyondDeadline
+	}
+	if g.interval > 0 {
+		g.next = at.Add(g.interval)
+	}
 	g.mu.Unlock()
 
 	d := time.Until(at)
@@ -250,11 +288,13 @@ func (g *gate) waitRate(ctx context.Context) error {
 		return nil
 	case <-ctx.Done():
 		// 예약한 자리를 반납한다(뒤에 예약한 사람이 없을 때만 안전하게 되돌릴 수 있다).
-		g.mu.Lock()
-		if g.next.Equal(at.Add(g.interval)) {
-			g.next = at
+		if g.interval > 0 {
+			g.mu.Lock()
+			if g.next.Equal(at.Add(g.interval)) {
+				g.next = at
+			}
+			g.mu.Unlock()
 		}
-		g.mu.Unlock()
 		return ctx.Err()
 	}
 }
@@ -268,21 +308,65 @@ func (g *gate) deferRate(until time.Time) {
 	g.mu.Unlock()
 }
 
-func (g *gate) breakerOpen() bool {
+// breakerAdmit 은 브레이커가 요청을 들여보내는지다. 열린 뒤 쿨다운이 지나면(half-open) 시험 요청 한 건만
+// 들여보내고, 그 결과가 나올 때까지(최대 쿨다운 한 번) 나머지는 계속 막는다.
+func (g *gate) breakerAdmit() (admit bool, probe uint64) {
+	if g.breakerFailures <= 0 {
+		return true, 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.tripped {
+		return true, 0
+	}
+	now := time.Now()
+	if now.Before(g.openUntil) || now.Before(g.probeUntil) {
+		return false, 0
+	}
+	g.probeUntil = now.Add(g.breakerCooldown) // 시험 요청 자리. 결과가 안 오면 이 시각 뒤 다른 요청이 시험한다
+	g.probeGen++
+	return true, g.probeGen
+}
+
+// ownsProbe 는 probe 세대가 지금 시험 자리를 가진 시험 요청인지다. g.mu 를 잡은 채로 부른다.
+func (g *gate) ownsProbe(probe uint64) bool {
+	return probe != 0 && probe == g.probeGen && g.tripped && !g.probeUntil.IsZero()
+}
+
+// releaseProbe 는 시험 요청 자리를 돌려준다(시험 요청이 판정 없이 끝났을 때). 다음 요청이 다시 시험한다.
+// 이미 다음 세대로 넘어간 옛 시험 요청이면 아무것도 하지 않는다.
+func (g *gate) releaseProbe(probe uint64) {
+	if probe == 0 {
+		return
+	}
+	g.mu.Lock()
+	if g.ownsProbe(probe) {
+		g.probeUntil = time.Time{}
+	}
+	g.mu.Unlock()
+}
+
+// breakerBlocked 는 지금 요청이 브레이커에 막힐지다(시험 자리를 쓰지 않는다).
+func (g *gate) breakerBlocked() bool {
 	if g.breakerFailures <= 0 {
 		return false
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return time.Now().Before(g.openUntil)
+	now := time.Now()
+	return g.tripped && (now.Before(g.openUntil) || now.Before(g.probeUntil))
 }
 
 // reportNeutral 은 provider 탓이 아닌 실패(호출자 요청 오류·응답 검증 실패)를 통계에만 반영한다.
-// 서킷 브레이커의 연속 실패 횟수는 건드리지 않는다.
-func (g *gate) reportNeutral() { g.stats.Fail.Add(1) }
+// 서킷 브레이커의 연속 실패 횟수는 건드리지 않는다. 시험 요청이었다면 판정 없이 끝난 것이므로 자리를 돌려준다.
+func (g *gate) reportNeutral(probe uint64) {
+	g.stats.Fail.Add(1)
+	g.releaseProbe(probe)
+}
 
-// report 는 호출 결과를 서킷 브레이커와 통계에 반영한다.
-func (g *gate) report(ok bool) {
+// report 는 호출 결과를 서킷 브레이커와 통계에 반영한다. 브레이커가 열린 동안에는 시험 요청(probe)의
+// 결과만 센다 — 열리기 전에 들어가 있던 요청이 늦게 성공해도 쿨다운 중에 닫히지 않는다.
+func (g *gate) report(ok bool, probe uint64) {
 	if ok {
 		g.stats.OK.Add(1)
 	} else {
@@ -293,13 +377,24 @@ func (g *gate) report(ok bool) {
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if probe != 0 && !g.ownsProbe(probe) {
+		return // 자리를 잃은 옛 시험 요청(쿨다운보다 오래 걸렸다)의 결과는 무시한다
+	}
+	if g.tripped && probe == 0 {
+		return // 열리기 전에 들어가 있던 요청의 결과는 쿨다운 중인 브레이커를 바꾸지 않는다
+	}
 	if ok {
 		g.consecFail = 0
+		g.tripped = false
+		g.probeUntil = time.Time{}
 		return
 	}
 	g.consecFail++
-	if g.consecFail >= g.breakerFailures {
+	// half-open 시험 요청이 실패하면 기다리지 않고 바로 다시 연다.
+	if probe != 0 || g.consecFail >= g.breakerFailures {
+		g.tripped = true
 		g.openUntil = time.Now().Add(g.breakerCooldown)
+		g.probeUntil = time.Time{}
 		g.consecFail = 0
 	}
 }

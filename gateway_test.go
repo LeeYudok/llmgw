@@ -483,7 +483,7 @@ func TestSingleflightCancelledWhenAllWaitersLeave(t *testing.T) {
 }
 
 func TestCacheBounded(t *testing.T) {
-	g := &Gateway{cache: map[string]cacheEntry{}}
+	g := &Gateway{cfg: &Config{}, cache: map[string]cacheEntry{}}
 	g.mu.Lock()
 	for i := range maxCacheEntries + 100 {
 		g.putCache(fmt.Sprint(i), &Response{Content: fmt.Sprint(i)}, time.Hour)

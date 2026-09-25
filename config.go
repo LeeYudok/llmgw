@@ -6,10 +6,13 @@
 package llmgw
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +31,8 @@ type Config struct {
 	LogPath string `toml:"log_path" yaml:"log_path"`
 	// Mask 는 provider 로 보내기 전에 프롬프트의 개인정보·비밀값을 가리는 규칙이다.
 	Mask MaskConfig `toml:"mask" yaml:"mask"`
+	// CacheMaxBytes — 응답 캐시가 쓸 최대 메모리(기본 "64MiB"). 항목 수 상한(1024)과 함께 적용한다.
+	CacheMaxBytes ByteSize `toml:"cache_max_bytes" yaml:"cache_max_bytes"`
 }
 
 // MaskConfig 는 프롬프트 마스킹 규칙이다. 가린 값은 [REDACTED:<종류>] 로 바뀌고 원문은 어디에도 남지 않는다.
@@ -75,6 +80,11 @@ type ProviderConfig struct {
 	// StreamIdleTimeout — 스트림이 시작된 뒤 이 시간 동안 새 줄이 오지 않으면 끊는다(기본 60s).
 	// timeout 은 스트림에서는 응답 헤더를 받을 때까지만 적용된다.
 	StreamIdleTimeout Duration `toml:"stream_idle_timeout" yaml:"stream_idle_timeout"`
+	// StreamUsage — true 면 스트림 요청에 stream_options.include_usage 를 붙여 토큰 사용량을 받는다(vLLM·OpenAI 지원).
+	// 마지막에 choices 가 빈 청크가 하나 더 오므로, 그것을 처리하지 못하는 호출자가 있으면 끈다.
+	StreamUsage bool `toml:"stream_usage" yaml:"stream_usage"`
+	// MaxResponseBytes — 일반 응답 본문과 스트림 한 줄의 최대 크기(기본 "8MiB"). 넘으면 그 시도를 실패로 보고 다음 step 으로.
+	MaxResponseBytes ByteSize `toml:"max_response_bytes" yaml:"max_response_bytes"`
 
 	Extra map[string]any `toml:"extra" yaml:"extra"` // 요청 body 에 그대로 합칠 추가 필드
 }
@@ -151,7 +161,39 @@ type Validation struct {
 // ServerConfig 는 OpenAI 호환 HTTP 서버 모드 설정이다.
 type ServerConfig struct {
 	Addr string `toml:"addr" yaml:"addr"` // 기본 127.0.0.1:17902
+	// MaxInflight — 서버가 동시에 붙잡는 chat·passthrough 요청 수(기본 512, 음수면 무제한). 넘치면 본문을 읽기 전에
+	// 503 으로 돌려보낸다. 대기열에서 기다리는 요청도 본문을 메모리에 들고 있으므로 이 값이 메모리 상한을 정한다.
+	MaxInflight int `toml:"max_inflight" yaml:"max_inflight"`
+	// MaxRequestBytes — chat 요청 본문 최대 크기(기본 "32MiB"). 넘으면 413.
+	MaxRequestBytes ByteSize `toml:"max_request_bytes" yaml:"max_request_bytes"`
+	// MemoryLimit — Go 런타임 메모리 목표(예: "2GiB"). 이 근처에 오면 GC 를 더 자주 돌려 OOM 킬을 피한다.
+	// GOMEMLIMIT 환경변수와 같다. 비우면 설정하지 않는다. 컨테이너 한도의 80~90% 정도로 둔다.
+	MemoryLimit ByteSize `toml:"memory_limit" yaml:"memory_limit"`
 }
+
+// ByteSize 는 "64MiB", "512KB", "1GiB", "1048576" 같은 문자열을 받는 바이트 수다.
+type ByteSize int64
+
+func (b *ByteSize) UnmarshalText(t []byte) error {
+	s := strings.TrimSpace(string(t))
+	num := strings.TrimRight(s, "KMGTiBkb")
+	unit := strings.ToUpper(strings.TrimSpace(s[len(num):]))
+	n, err := strconv.ParseFloat(strings.TrimSpace(num), 64)
+	if err != nil || n < 0 {
+		return fmt.Errorf("byte size %q: 숫자+단위(KiB·MiB·GiB·KB·MB·GB)로 쓴다", s)
+	}
+	mult := map[string]float64{
+		"": 1, "B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12,
+		"KIB": 1 << 10, "MIB": 1 << 20, "GIB": 1 << 30, "TIB": 1 << 40,
+	}[unit]
+	if mult == 0 {
+		return fmt.Errorf("byte size %q: 모르는 단위 %q", s, unit)
+	}
+	*b = ByteSize(n * mult)
+	return nil
+}
+
+func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error { return b.UnmarshalText([]byte(n.Value)) }
 
 // Duration 은 "30s", "2m" 같은 문자열을 받는 time.Duration 이다.
 type Duration struct{ time.Duration }
@@ -176,11 +218,22 @@ func LoadConfig(path string) (*Config, error) {
 	var c Config
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".toml":
-		if _, err := toml.Decode(string(b), &c); err != nil {
+		md, err := toml.Decode(string(b), &c)
+		if err != nil {
 			return nil, fmt.Errorf("toml %s: %w", path, err)
 		}
+		// 모르는 키는 오타이거나 다른 표([server] 아래 등)에 잘못 들어간 키다. 조용히 무시하지 않는다.
+		if u := md.Undecoded(); len(u) > 0 {
+			keys := make([]string, len(u))
+			for i, k := range u {
+				keys[i] = k.String()
+			}
+			return nil, fmt.Errorf("toml %s: 모르는 키 %s", path, strings.Join(keys, ", "))
+		}
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(b, &c); err != nil {
+		dec := yaml.NewDecoder(bytes.NewReader(b))
+		dec.KnownFields(true) // 모르는 키는 에러
+		if err := dec.Decode(&c); err != nil && err != io.EOF {
 			return nil, fmt.Errorf("yaml %s: %w", path, err)
 		}
 	default:
@@ -196,6 +249,15 @@ func LoadConfig(path string) (*Config, error) {
 func (c *Config) applyDefaults() {
 	if c.Server.Addr == "" {
 		c.Server.Addr = "127.0.0.1:17902"
+	}
+	if c.Server.MaxInflight == 0 {
+		c.Server.MaxInflight = 512
+	}
+	if c.Server.MaxRequestBytes == 0 {
+		c.Server.MaxRequestBytes = 32 << 20
+	}
+	if c.CacheMaxBytes == 0 {
+		c.CacheMaxBytes = 64 << 20
 	}
 	for _, p := range c.Providers {
 		p.BaseURL = strings.TrimRight(p.BaseURL, "/")
@@ -213,6 +275,9 @@ func (c *Config) applyDefaults() {
 		}
 		if p.BreakerCooldown.Duration == 0 {
 			p.BreakerCooldown.Duration = 30 * time.Second
+		}
+		if p.MaxResponseBytes == 0 {
+			p.MaxResponseBytes = 8 << 20
 		}
 		if p.StreamIdleTimeout.Duration == 0 {
 			p.StreamIdleTimeout.Duration = 60 * time.Second

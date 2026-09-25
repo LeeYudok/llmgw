@@ -125,10 +125,13 @@ type Gateway struct {
 	hc          *http.Client
 	log         *requestLog
 	masker      *masker
+	// inflightGauge 는 Handler 가 만든 서버 동시 요청 카운터다(통계용, 서버 모드가 아니면 nil).
+	inflightGauge *inflight
 
-	mu       sync.Mutex
-	inflight map[string]*flight // 같은 요청 동시 호출 합치기
-	cache    map[string]cacheEntry
+	mu         sync.Mutex
+	inflight   map[string]*flight // 같은 요청 동시 호출 합치기
+	cache      map[string]cacheEntry
+	cacheBytes int64 // 캐시 항목 size 합계(g.mu 로 보호)
 }
 
 // flight 는 같은 요청을 한 번만 호출하는 공유 호출이다. 호출은 기다리는 사람이 한 명이라도 남아 있는 동안
@@ -146,6 +149,7 @@ const maxCacheEntries = 1024
 
 type cacheEntry struct {
 	resp    *Response
+	size    int64 // responseBytes 어림값
 	added   time.Time
 	expires time.Time
 }
@@ -289,27 +293,52 @@ func (g *Gateway) fly(ctx context.Context, key string, f *flight, route *RouteCo
 	close(f.done)
 }
 
-// putCache 는 g.mu 를 잡은 채로 부른다. 항목 수가 maxCacheEntries 를 넘지 않게 한다.
+// responseBytes 는 캐시에 둔 응답이 차지하는 메모리를 어림한다(본문·추론·시도 기록).
+func responseBytes(r *Response) int64 {
+	n := len(r.Content) + len(r.Reasoning) + len(r.Provider) + len(r.Model) + 256
+	for _, a := range r.Attempts {
+		n += 128 + len(a.Error) + len(a.Detail)
+	}
+	return int64(n)
+}
+
+// putCache 는 g.mu 를 잡은 채로 부른다. 항목 수는 maxCacheEntries, 메모리는 cache_max_bytes 를 넘지 않게 한다.
+// 넘치면 만료된 항목을, 그래도 넘치면 오래된 항목부터 버린다. 혼자서 상한을 넘는 응답은 캐시하지 않는다.
 func (g *Gateway) putCache(key string, resp *Response, ttl time.Duration) {
+	size := responseBytes(resp)
+	limit := int64(g.cfg.CacheMaxBytes)
+	if limit > 0 && size > limit {
+		return
+	}
+	if old, ok := g.cache[key]; ok {
+		g.cacheBytes -= old.size
+		delete(g.cache, key)
+	}
+	full := func() bool {
+		return len(g.cache) >= maxCacheEntries || (limit > 0 && g.cacheBytes+size > limit)
+	}
 	now := time.Now()
-	if _, ok := g.cache[key]; !ok && len(g.cache) >= maxCacheEntries {
+	if full() {
 		for k, e := range g.cache {
 			if now.After(e.expires) {
+				g.cacheBytes -= e.size
 				delete(g.cache, k)
 			}
 		}
-		for len(g.cache) >= maxCacheEntries { // 만료된 것이 없으면 가장 오래된 항목부터 버린다
-			var oldest string
-			var at time.Time
-			for k, e := range g.cache {
-				if oldest == "" || e.added.Before(at) {
-					oldest, at = k, e.added
-				}
-			}
-			delete(g.cache, oldest)
-		}
 	}
-	g.cache[key] = cacheEntry{resp: resp, added: now, expires: now.Add(ttl)}
+	for full() && len(g.cache) > 0 {
+		var oldest string
+		var at time.Time
+		for k, e := range g.cache {
+			if oldest == "" || e.added.Before(at) {
+				oldest, at = k, e.added
+			}
+		}
+		g.cacheBytes -= g.cache[oldest].size
+		delete(g.cache, oldest)
+	}
+	g.cache[key] = cacheEntry{resp: resp, size: size, added: now, expires: now.Add(ttl)}
+	g.cacheBytes += size
 }
 
 func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Response, error) {
@@ -337,7 +366,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
-			release, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
+			pm, err := gt.acquireWithin(ctx, g.stepMaxWait(route, i, req.NoExternal))
 			a.WaitedMS = time.Since(t0).Milliseconds()
 			if err != nil {
 				if ctx.Err() != nil {
@@ -349,7 +378,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 			t1 := time.Now()
 			c, err := doCall(ctx, g.hc, p, g.keys[s.Provider], body)
-			release()
+			pm.release()
 			a.LatencyMS = time.Since(t1).Milliseconds()
 
 			if err == nil {
@@ -358,12 +387,12 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					verr = checkSchema(c.content, schemaOf(req.ResponseFormat))
 				}
 				if verr != nil {
-					gt.reportNeutral() // 요청 내용에 따라 갈리는 실패라 provider 전체를 막지 않는다
+					pm.reportNeutral() // 요청 내용에 따라 갈리는 실패라 provider 전체를 막지 않는다
 					a.Error = "검증 실패: " + verr.Error()
 					attempts = append(attempts, a)
 					break // 같은 설정으로 다시 불러도 같은 결과일 가능성이 커서 다음 step 으로
 				}
-				gt.report(true)
+				pm.report(true)
 				gt.lat.observe(time.Since(t1))
 				attempts = append(attempts, a)
 				if c.model == "" {
@@ -376,14 +405,15 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 
 			if ctx.Err() != nil {
+				pm.abandon()          // 시험 요청이 취소로 끝났으면 자리를 돌려준다
 				return nil, ctx.Err() // 호출자 취소는 provider 실패로 세지 않는다
 			}
 			var ce *callError
 			errors.As(err, &ce)
 			if ce != nil && !ce.providerFault() {
-				gt.reportNeutral()
+				pm.reportNeutral()
 			} else {
-				gt.report(false)
+				pm.report(false)
 			}
 			a.setError(err)
 			attempts = append(attempts, a)

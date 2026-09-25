@@ -3,7 +3,10 @@ package llmgw
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,8 +77,10 @@ func (g *Gateway) record(req Request, resp *Response, err error, d time.Duration
 			if resp.Cached {
 				s.Cached.Add(1)
 			}
-			s.PromptTokens.Add(int64(resp.Usage.PromptTokens))
-			s.CompletionTokens.Add(int64(resp.Usage.CompletionTokens))
+			if !resp.Cached { // 캐시·합치기로 받은 응답은 upstream 을 다시 부르지 않았으므로 토큰을 세지 않는다
+				s.PromptTokens.Add(int64(resp.Usage.PromptTokens))
+				s.CompletionTokens.Add(int64(resp.Usage.CompletionTokens))
+			}
 		case errors.Is(err, ErrClientLimited) || errors.Is(err, ErrRouteNotAllowed):
 			s.Rejected.Add(1)
 		default:
@@ -105,6 +110,37 @@ func (g *Gateway) record(req Request, resp *Response, err error, d time.Duration
 	g.log.mu.Lock()
 	g.log.f.Write(append(b, '\n'))
 	g.log.mu.Unlock()
+}
+
+// MemoryStat 은 게이트웨이 프로세스의 메모리 상태다(OOM 감시용).
+type MemoryStat struct {
+	HeapAllocBytes uint64 // 살아 있는 힙
+	HeapSysBytes   uint64 // OS 에서 받은 힙
+	GCLimitBytes   int64  // server.memory_limit(GOMEMLIMIT). 없으면 -1
+	Goroutines     int
+	CacheEntries   int
+	CacheBytes     int64
+	Inflight       int64 // 서버가 지금 붙잡고 있는 요청 수
+	Shed           int64 // server.max_inflight 로 503 을 돌려준 수
+}
+
+// MemoryStats 는 메모리 스냅샷을 돌려준다.
+func (g *Gateway) MemoryStats() MemoryStat {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	lim := debug.SetMemoryLimit(-1) // -1 은 읽기만 한다
+	if lim == math.MaxInt64 {
+		lim = -1
+	}
+	g.mu.Lock()
+	entries, bytes := len(g.cache), g.cacheBytes
+	g.mu.Unlock()
+	st := MemoryStat{HeapAllocBytes: ms.HeapAlloc, HeapSysBytes: ms.HeapSys, GCLimitBytes: lim,
+		Goroutines: runtime.NumGoroutine(), CacheEntries: entries, CacheBytes: bytes}
+	if f := g.inflightGauge; f != nil {
+		st.Inflight, st.Shed = f.n.Load(), f.shed.Load()
+	}
+	return st
 }
 
 // Close 는 요청 로그 파일을 닫는다.

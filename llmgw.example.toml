@@ -2,9 +2,13 @@
 # 키 값은 여기 쓰지 않는다. api_key_env 에 환경변수 이름만 적는다.
 
 log_path = "llmgw-requests.jsonl"   # 요청 1건당 JSONL 한 줄(본문 제외). 비우면 기록 안 함
+cache_max_bytes = "64MiB"           # 응답 캐시 메모리 상한
 
 [server]
 addr = "127.0.0.1:17902"
+max_inflight      = 512       # 동시에 붙잡는 요청 수. 넘치면 503
+max_request_bytes = "32MiB"   # 요청 본문 상한. 넘으면 413
+# memory_limit    = "1800MiB" # 컨테이너 한도(예: 2GiB)의 80~90%. GOMEMLIMIT 과 같다
 
 # external provider 로 보내는 프롬프트의 주민번호·카드·전화·계좌·이메일·API 키를 [REDACTED:<종류>] 로 가린다.
 [mask]

@@ -5,12 +5,14 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,10 +29,12 @@ import (
 // 그 클라이언트는 인증할 수 없을 뿐 서버가 열리지는 않는다 — 기동 전에 CheckClientKeys 로 확인한다.
 func (g *Gateway) Handler() http.Handler {
 	auth := newAuthenticator(g.cfg.Clients)
+	admit := newInflight(g.cfg.Server.MaxInflight)
+	g.inflightGauge = admit
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /stats", auth.wrap(func(w http.ResponseWriter, _ *http.Request, _ string) {
-		writeJSON(w, http.StatusOK, map[string]any{"providers": g.Stats(), "clients": g.ClientStats()})
+		writeJSON(w, http.StatusOK, map[string]any{"providers": g.Stats(), "clients": g.ClientStats(), "memory": g.MemoryStats()})
 	}))
 	mux.HandleFunc("GET /v1/models", auth.wrap(func(w http.ResponseWriter, _ *http.Request, client string) {
 		names := g.Routes()
@@ -44,9 +48,33 @@ func (g *Gateway) Handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	}))
-	mux.HandleFunc("POST /v1/chat/completions", auth.wrap(g.handleChat))
-	mux.HandleFunc("/passthrough/{provider}/{path...}", auth.wrap(g.handlePassthrough))
+	mux.HandleFunc("POST /v1/chat/completions", admit.wrap(auth.wrap(g.handleChat)))
+	mux.HandleFunc("/passthrough/{provider}/{path...}", admit.wrap(auth.wrap(g.handlePassthrough)))
 	return mux
+}
+
+// inflight 는 서버가 동시에 붙잡는 요청 수를 제한한다. 넘치면 본문을 읽기 전에 503 으로 돌려보낸다.
+// 대기열에서 기다리는 요청도 본문을 메모리에 들고 있으므로, 이 상한이 곧 요청 본문이 쓰는 메모리의 상한이다.
+type inflight struct {
+	limit int64 // 0 이하면 무제한
+	n     atomic.Int64
+	shed  atomic.Int64 // 503 으로 돌려보낸 수
+}
+
+func newInflight(limit int) *inflight { return &inflight{limit: int64(limit)} }
+
+func (f *inflight) wrap(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if n := f.n.Add(1); f.limit > 0 && n > f.limit {
+			f.n.Add(-1)
+			f.shed.Add(1)
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "게이트웨이 동시 요청 한도(server.max_inflight) 초과")
+			return
+		}
+		defer f.n.Add(-1)
+		h(w, r)
+	}
 }
 
 // authenticator 는 Bearer 키를 클라이언트 이름으로 바꾼다.
@@ -111,7 +139,12 @@ func (g *Gateway) handleChat(w http.ResponseWriter, r *http.Request, client stri
 			EnableThinking *bool `json:"enable_thinking"`
 		} `json:"chat_template_kwargs"`
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&in); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, int64(g.cfg.Server.MaxRequestBytes))).Decode(&in); err != nil {
+		var tooBig *http.MaxBytesError
+		if errors.As(err, &tooBig) {
+			writeErr(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("요청 본문이 server.max_request_bytes(%d) 초과", tooBig.Limit))
+			return
+		}
 		writeErr(w, http.StatusBadRequest, "요청 JSON: "+err.Error())
 		return
 	}
@@ -210,6 +243,14 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 		writeErr(w, http.StatusNotFound, "passthrough provider 없음: "+name)
 		return
 	}
+	// 경로에 . / .. 이 있으면 base_url 밖으로 나갈 수 있으므로 거절한다. 전달은 인코딩된 원래 경로로 한다
+	// (디코딩한 경로를 이어 붙이면 %3F 같은 인코딩이 풀려 쿼리가 끼어든다).
+	for _, seg := range strings.Split(r.PathValue("path"), "/") {
+		if seg == ".." || seg == "." {
+			writeErr(w, http.StatusBadRequest, "passthrough 경로에 . 또는 .. 을 쓸 수 없음")
+			return
+		}
+	}
 	if c := g.cfg.Clients[client]; c != nil && !c.allowsPassthrough(name) {
 		writeErr(w, http.StatusForbidden, "허용되지 않은 passthrough: "+name)
 		return
@@ -228,15 +269,17 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 		defer release()
 	}
 	gt := g.gates[name]
-	release, err := gt.acquire(r.Context())
+	pm, err := gt.acquireWithin(r.Context(), 0)
 	if err != nil {
 		w.Header().Set("Retry-After", "5")
 		writeErr(w, http.StatusTooManyRequests, "provider 대기열: "+err.Error())
 		return
 	}
-	defer release()
+	defer pm.release()
 
-	target := p.BaseURL + "/" + r.PathValue("path")
+	raw := strings.TrimPrefix(r.URL.EscapedPath(), "/passthrough/")
+	_, rawPath, _ := strings.Cut(raw, "/")
+	target := p.BaseURL + "/" + rawPath
 	if r.URL.RawQuery != "" {
 		target += "?" + r.URL.RawQuery
 	}
@@ -259,16 +302,16 @@ func (g *Gateway) handlePassthrough(w http.ResponseWriter, r *http.Request, clie
 	resp, err := g.hc.Do(out)
 	if err != nil {
 		if r.Context().Err() != nil {
-			gt.reportNeutral() // 호출자가 끊은 것은 provider 실패가 아니다
+			pm.reportNeutral() // 호출자가 끊은 것은 provider 실패가 아니다
 		} else {
-			gt.report(false)
+			pm.report(false)
 		}
 		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
 		writeErr(w, http.StatusBadGateway, transportError(err, timedOut, false).public()) // 내부 주소를 내보내지 않는다
 		return
 	}
 	defer resp.Body.Close()
-	gt.report(resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests)
+	pm.report(resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests)
 	if ra := parseRetryAfter(resp.Header.Get("Retry-After")); resp.StatusCode == http.StatusTooManyRequests && ra > 0 {
 		gt.deferRate(time.Now().Add(ra))
 	}

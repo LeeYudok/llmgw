@@ -120,7 +120,7 @@ func TestAutoSpill(t *testing.T) {
 	}
 	// 다음 step 이 요청을 받을 수 없는 상태(브레이커 열림)면 넘기지 않는다.
 	g.gates["b"].mu.Lock()
-	g.gates["b"].breakerFailures, g.gates["b"].openUntil = 1, time.Now().Add(time.Minute)
+	g.gates["b"].breakerFailures, g.gates["b"].tripped, g.gates["b"].openUntil = 1, true, time.Now().Add(time.Minute)
 	g.gates["b"].mu.Unlock()
 	if why := g.autoSpill(g.cfg.Routes["r"], 0, false); why != "" {
 		t.Fatalf("받을 수 없는 step 으로 넘기면 안 됨: %s", why)
