@@ -6,6 +6,13 @@ log_path = "llmgw-requests.jsonl"   # 요청 1건당 JSONL 한 줄(본문 제외
 [server]
 addr = "127.0.0.1:17902"
 
+# external provider 로 보내는 프롬프트의 주민번호·카드·전화·계좌·이메일·API 키를 [REDACTED:<종류>] 로 가린다.
+[mask]
+external = true
+# kinds = ["rrn", "card", "phone", "account", "email", "secret"]   # 비우면 전부
+# [mask.custom]
+# employee_id = '\bE\d{6}\b'                                      # 추가 패턴(이름 → 정규식)
+
 # ── 프로바이더 ─────────────────────────────────────────────────────────────
 
 # 자체 호스팅 vLLM 예시. 동시 처리 수·대기열은 GPU 성능에 맞춰 조정한다.

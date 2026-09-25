@@ -56,6 +56,9 @@ type Attempt struct {
 	Error     string `json:"error,omitempty"`
 	WaitedMS  int64  `json:"waited_ms"`
 	LatencyMS int64  `json:"latency_ms"`
+	Masked    int    `json:"masked,omitempty"` // 이 시도에서 가린 개인정보·비밀값 수
+	// Detail 은 upstream 에러 원문(내부 주소·응답 본문 포함)이다. 호출자에게는 내보내지 않고 요청 로그에만 남긴다.
+	Detail string `json:"-"`
 }
 
 // ErrAllFailed 는 체인의 모든 step 이 실패했을 때 반환한다. errors.As 로 *ChainError 를 꺼낼 수 있다.
@@ -87,6 +90,31 @@ func (e *ChainError) Error() string {
 
 func (e *ChainError) Unwrap() error { return ErrAllFailed }
 
+// Detail 은 upstream 원문을 포함한 에러 설명이다(서버 로그·CLI 용 — 호출자에게 내보내지 않는다).
+func (e *ChainError) Detail() string {
+	parts := make([]string, 0, len(e.Attempts))
+	for _, a := range e.Attempts {
+		d := a.Error
+		if a.Detail != "" && a.Detail != a.Error {
+			d += " — " + a.Detail
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s", a.Provider, d))
+	}
+	return ErrAllFailed.Error() + " (" + strings.Join(parts, "; ") + ")"
+}
+
+// setError 는 시도 기록에 에러를 남긴다. 호출자에게 보이는 Error 는 분류만, 원문은 Detail 에 둔다.
+func (a *Attempt) setError(err error) {
+	var ce *callError
+	if errors.As(err, &ce) {
+		a.Status = ce.status
+		a.Error = ce.public()
+		a.Detail = ce.Error()
+		return
+	}
+	a.Error = err.Error()
+}
+
 // Gateway 는 설정을 들고 요청을 라우팅한다. 여러 고루틴에서 동시에 써도 된다.
 type Gateway struct {
 	cfg         *Config
@@ -96,6 +124,7 @@ type Gateway struct {
 	keys        map[string]string
 	hc          *http.Client
 	log         *requestLog
+	masker      *masker
 
 	mu       sync.Mutex
 	inflight map[string]*flight // 같은 요청 동시 호출 합치기
@@ -139,6 +168,11 @@ func New(cfg *Config) (*Gateway, error) {
 		})
 		g.clientStats[name] = &clientStats{}
 	}
+	m, err := newMasker(cfg.Mask)
+	if err != nil {
+		return nil, err
+	}
+	g.masker = m
 	if cfg.LogPath != "" {
 		l, err := openRequestLog(cfg.LogPath)
 		if err != nil {
@@ -291,12 +325,13 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			attempts = append(attempts, Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Error: ErrExternalBlocked.Error()})
 			continue
 		}
+		masked := g.maskBody(p, body)
 
 		for try := 0; ; try++ {
 			if err := ctx.Err(); err != nil {
 				return nil, err
 			}
-			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning}
+			a := Attempt{Step: i, Provider: s.Provider, Model: model, Reasoning: s.Reasoning, Masked: masked}
 			t0 := time.Now()
 			release, err := gt.acquire(ctx)
 			a.WaitedMS = time.Since(t0).Milliseconds()
@@ -345,10 +380,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			} else {
 				gt.report(false)
 			}
-			a.Error = err.Error()
-			if ce != nil {
-				a.Status = ce.status
-			}
+			a.setError(err)
 			attempts = append(attempts, a)
 			if ce == nil || !ce.retryable || try >= s.Retries {
 				break
@@ -369,6 +401,17 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 		}
 	}
 	return nil, &ChainError{Attempts: attempts}
+}
+
+// maskBody 는 provider 규칙에 따라 body 의 messages 를 가리고 가린 건수를 돌려준다.
+func (g *Gateway) maskBody(p *ProviderConfig, body map[string]any) int {
+	if !(p.Mask || (p.External && g.cfg.Mask.External)) {
+		return 0
+	}
+	msgs, _ := body["messages"].([]Message)
+	out, n := g.masker.maskMessages(msgs)
+	body["messages"] = out
+	return n
 }
 
 // backoff 는 0.5s·1s·2s… 지수 증가에 0~250ms 지터를 더한다(최대 8s).

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -31,7 +32,28 @@ type callError struct {
 	status     int
 	retryAfter time.Duration
 	retryable  bool
-	msg        string
+	msg        string // 원문(내부 주소·upstream 응답 본문 포함) — 로그용
+	kind       string // 호출자에게 보여줄 분류(status 가 없을 때)
+}
+
+// public 은 호출자에게 내보낼 에러 설명이다. upstream 원문·내부 주소를 담지 않는다.
+func (e *callError) public() string {
+	if e.status > 0 {
+		return fmt.Sprintf("HTTP %d", e.status)
+	}
+	if e.kind != "" {
+		return e.kind
+	}
+	return "호출 실패"
+}
+
+// transportError 는 hc.Do 실패를 분류한다. timedOut 이면 타임아웃, 아니면 연결 실패다.
+func transportError(err error, timedOut, retryable bool) *callError {
+	kind := "연결 실패"
+	if timedOut {
+		kind = "타임아웃"
+	}
+	return &callError{msg: err.Error(), kind: kind, retryable: retryable}
 }
 
 // providerFault 는 실패가 provider 쪽 문제(네트워크·타임아웃·408·429·5xx·깨진 응답)인지다.
@@ -244,13 +266,13 @@ func wantsJSON(req *Request) bool {
 func doCall(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey string, body map[string]any) (*completion, error) {
 	b, err := json.Marshal(body)
 	if err != nil {
-		return nil, &callError{msg: "요청 직렬화: " + err.Error()}
+		return nil, &callError{msg: "요청 직렬화: " + err.Error(), kind: "요청 직렬화 실패"}
 	}
 	ctx, cancel := context.WithTimeout(ctx, p.Timeout.Duration)
 	defer cancel()
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL+"/chat/completions", bytes.NewReader(b))
 	if err != nil {
-		return nil, &callError{msg: err.Error()}
+		return nil, &callError{msg: err.Error(), kind: "요청 생성 실패"}
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	if apiKey != "" {
@@ -259,12 +281,13 @@ func doCall(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey stri
 	resp, err := hc.Do(hreq)
 	if err != nil {
 		// 호출자 취소가 아니면 네트워크·타임아웃이므로 재시도 대상이다.
-		return nil, &callError{msg: err.Error(), retryable: ctx.Err() == nil || ctx.Err() == context.DeadlineExceeded}
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		return nil, transportError(err, timedOut, ctx.Err() == nil || timedOut)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
-		return nil, &callError{msg: "응답 읽기: " + err.Error(), retryable: true}
+		return nil, &callError{msg: "응답 읽기: " + err.Error(), kind: "응답 읽기 실패", retryable: true}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, &callError{
@@ -294,10 +317,10 @@ func doCall(ctx context.Context, hc *http.Client, p *ProviderConfig, apiKey stri
 		} `json:"usage"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
-		return nil, &callError{msg: "응답 JSON: " + err.Error()}
+		return nil, &callError{msg: "응답 JSON: " + err.Error(), kind: "응답 형식 오류"}
 	}
 	if len(r.Choices) == 0 {
-		return nil, &callError{msg: "choices 비어 있음"}
+		return nil, &callError{msg: "choices 비어 있음", kind: "choices 비어 있음"}
 	}
 	m := r.Choices[0].Message
 	reasoning := m.ReasoningContent

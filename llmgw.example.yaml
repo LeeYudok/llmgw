@@ -2,6 +2,8 @@
 log_path: llmgw-requests.jsonl
 server:
   addr: 127.0.0.1:17902
+mask:
+  external: true
 
 providers:
   qwen:

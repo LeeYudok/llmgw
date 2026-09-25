@@ -98,6 +98,7 @@ func (g *Gateway) record(req Request, resp *Response, err error, d time.Duration
 		var ce *ChainError
 		if errors.As(err, &ce) {
 			l.Steps = len(ce.Attempts)
+			l.Error = ce.Detail() // 서버 로그에는 upstream 원문까지 남긴다
 		}
 	}
 	b, _ := json.Marshal(l)

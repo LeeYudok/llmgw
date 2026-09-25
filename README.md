@@ -67,6 +67,31 @@ clients 를 정의했으면 인증 없이는 열리지 않는다. `serve` 는 �
 
 passthrough 도 같은 규칙을 따른다(차단이면 403).
 
+## 개인정보 마스킹
+
+`[mask] external = true` 면 external provider 로 보내는 요청의 메시지에서 개인정보·비밀값을 `[REDACTED:<종류>]`
+로 바꿔 보낸다. 내부 provider 로는 원문 그대로 보낸다. external 이 아니어도 provider 에 `mask = true` 를 주면 가린다.
+
+| 종류 | 대상 |
+|---|---|
+| `rrn` | 주민등록번호·외국인등록번호 (YYMMDD-[1-8]NNNNNN, 하이픈 생략 포함) |
+| `card` | 16자리 카드번호 (Luhn 검사 통과) |
+| `phone` | 휴대전화·유선전화 |
+| `account` | 하이픈으로 나뉜 계좌번호(숫자 10~16자리). Luhn 이 맞지 않는 4-4-4-4 숫자열도 여기서 가린다 |
+| `email` | 이메일 주소 |
+| `secret` | `sk-…`, `up_…`, AWS access key, `Bearer …` 토큰 |
+
+`kinds` 로 쓸 종류를 고르고, `[mask.custom]` 에 이름 → 정규식(RE2)으로 패턴을 더한다. 가린 원문은 어디에도
+남기지 않으며 되돌릴 수 없다. 시도 기록의 `masked` 와 응답 헤더 `X-LLMGW-Masked` 에 가린 건수가 남는다.
+정규식 기반이라 형식이 다른 개인정보(이름, 주소, 하이픈 없는 계좌번호 등)는 잡지 못한다.
+passthrough 요청 본문은 형식을 알 수 없어 가리지 않는다.
+
+## 에러 메시지
+
+호출자에게 돌려주는 에러와 시도 기록에는 `HTTP 500`, `연결 실패`, `타임아웃` 같은 분류만 담는다. upstream 응답
+본문이나 내부 주소는 내보내지 않고 요청 로그(`log_path`)와 CLI 출력에만 남긴다. 라이브러리에서는
+`Attempt.Detail`, `ChainError.Detail()` 로 원문을 볼 수 있다.
+
 ## response_format
 
 호출자가 보낸 `response_format` 을 그대로 받는다. `json_schema`(strict 포함)는 provider 에
@@ -112,11 +137,15 @@ curl -s localhost:17902/v1/chat/completions -d '{"model":"news-deep","messages":
 curl -s localhost:17902/stats
 ```
 
-응답의 `llmgw` 필드에 실제 처리한 provider·캐시 여부·시도 기록이 들어 있다.
+응답의 `llmgw` 필드에 실제 처리한 provider·캐시 여부·시도 기록이 들어 있다. 같은 내용을 응답 헤더
+`X-LLMGW-Provider`, `X-LLMGW-Model`, `X-LLMGW-Attempts`, `X-LLMGW-Cached`, `X-LLMGW-Masked` 로도 준다.
+스트림 응답은 본문에 `llmgw` 필드를 넣을 수 없어 헤더로만 알 수 있다.
 
 `"stream": true` 면 provider 의 SSE 를 그대로 흘려보낸다. 첫 바이트를 받기 전의 실패(연결 오류·429·5xx)는
 평소처럼 재시도·폴백하고, 스트림이 시작된 뒤 끊기면 다른 provider 로 이어붙이지 않는다(부분 응답을 섞지 않는다).
-스트림 응답에는 검증·캐시를 적용하지 않는다. 라이브러리는 `Gateway.Stream` 을 쓴다.
+스트림 응답에는 검증·캐시를 적용하지 않는다. 라이브러리는 `Gateway.Stream`(시작 시점을 알고 싶으면 `StreamWithStart`)을 쓴다.
+스트림에서 provider `timeout` 은 응답 헤더를 받을 때까지만 적용되고, 그 뒤로는 줄 사이 간격이
+`stream_idle_timeout`(기본 60s)을 넘으면 끊는다. 스트림 전체 길이에는 제한이 없어 긴 추론 응답도 잘리지 않는다.
 
 키는 provider 의 `api_key_env` 환경변수에서 읽는다. `-env` 로 지정한 KEY=VALUE 파일은 환경변수에 없는 키만 채운다.
 
