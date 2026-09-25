@@ -405,6 +405,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 			}
 
 			if ctx.Err() != nil {
+				pm.abandon()          // 시험 요청이 취소로 끝났으면 자리를 돌려준다
 				return nil, ctx.Err() // 호출자 취소는 provider 실패로 세지 않는다
 			}
 			var ce *callError

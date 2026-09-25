@@ -275,12 +275,80 @@ func TestProbeReleasedOnAcquireFailure(t *testing.T) {
 	g.next = time.Time{}
 	g.mu.Unlock()
 	pm, err := g.acquireWithin(context.Background(), 0)
-	if err != nil || !pm.probe {
+	if err != nil || pm.probe == 0 {
 		t.Fatalf("다음 요청이 시험 요청이 되어야 함: %v", err)
 	}
 	pm.report(true)
 	pm.release()
 	if g.breakerBlocked() {
 		t.Fatal("시험 요청이 성공하면 닫혀야 함")
+	}
+}
+
+// 쿨다운보다 오래 걸린 옛 시험 요청의 결과는 새 시험 요청의 판정을 뒤집지 않는다.
+func TestStaleProbeIgnored(t *testing.T) {
+	g := newGate(&ProviderConfig{BreakerFailures: 1, BreakerCooldown: Duration{50 * time.Millisecond}, QueueTimeout: Duration{time.Second}})
+	g.mu.Lock()
+	g.tripped, g.openUntil = true, time.Now().Add(-time.Second)
+	g.mu.Unlock()
+	first, err := g.acquireWithin(context.Background(), 0)
+	if err != nil || first.probe == 0 {
+		t.Fatalf("첫 시험 요청: %v", err)
+	}
+	time.Sleep(70 * time.Millisecond) // 첫 시험 요청이 쿨다운보다 오래 걸려 자리를 잃는다
+	second, err := g.acquireWithin(context.Background(), 0)
+	if err != nil || second.probe == 0 || second.probe == first.probe {
+		t.Fatalf("두 번째 시험 요청은 새 세대여야 함: %v", err)
+	}
+	first.report(true) // 옛 시험 요청이 늦게 성공해도
+	first.release()
+	if !g.breakerBlocked() {
+		t.Fatal("옛 시험 요청의 성공이 브레이커를 닫으면 안 됨(새 시험 요청이 진행 중)")
+	}
+	first.reportNeutral() // 옛 시험 요청의 판정 없는 종료도 새 시험 요청의 자리를 비우면 안 됨
+	if !g.breakerBlocked() {
+		t.Fatal("옛 시험 요청이 새 시험 자리를 비우면 안 됨")
+	}
+	second.report(false) // 새 시험 요청의 실패는 다시 연다
+	second.release()
+	if !g.breakerBlocked() {
+		t.Fatal("새 시험 요청이 실패하면 열려야 함")
+	}
+}
+
+// 호출 도중 호출자가 취소한 시험 요청은 자리를 돌려줘 다음 요청이 바로 시험한다.
+func TestCancelledProbeReleased(t *testing.T) {
+	started := make(chan struct{})
+	f := newFake(t, func(n int64, w http.ResponseWriter) {
+		if n == 2 { // 두 번째 호출(시험 요청)은 취소될 때까지 붙잡는다
+			close(started)
+			time.Sleep(500 * time.Millisecond)
+		}
+		http.Error(w, "down", 500)
+	})
+	p := prov(f.srv.URL)
+	p.BreakerFailures, p.BreakerCooldown = 1, Duration{time.Minute}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": p},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	g.Call(context.Background(), userReq("r", "trip")) // 열림
+	gt := g.gates["a"]
+	gt.mu.Lock()
+	gt.openUntil = time.Now().Add(-time.Second) // 쿨다운 끝 → half-open
+	gt.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { g.Call(ctx, userReq("r", "probe")); close(done) }()
+	<-started
+	cancel()
+	<-done
+	// 호출은 합치기(singleflight) 고루틴에서 돌므로, Call 이 돌아온 뒤 잠깐 사이에 자리를 돌려준다.
+	deadline := time.Now().Add(300 * time.Millisecond)
+	for gt.breakerBlocked() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if gt.breakerBlocked() {
+		t.Fatal("취소된 시험 요청은 자리를 돌려줘야 함(쿨다운 한 번 더 막히면 안 됨)")
 	}
 }

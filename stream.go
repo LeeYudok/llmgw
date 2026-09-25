@@ -134,6 +134,7 @@ func (g *Gateway) StreamWithStart(ctx context.Context, req Request, onStart func
 				return r, nil
 			}
 			if ctx.Err() != nil {
+				pm.abandon() // 시험 요청이 취소로 끝났으면 자리를 돌려준다
 				return nil, ctx.Err()
 			}
 			var ce *callError
