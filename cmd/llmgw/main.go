@@ -115,6 +115,10 @@ func cmdCall(ctx context.Context, gw *llmgw.Gateway, args []string) int {
 }
 
 func cmdServe(ctx context.Context, gw *llmgw.Gateway, addr string) int {
+	if err := gw.CheckClientKeys(); err != nil {
+		log.Print(err)
+		return 1
+	}
 	srv := &http.Server{Addr: addr, Handler: gw.Handler(), ReadHeaderTimeout: 10 * time.Second}
 	go func() {
 		<-ctx.Done()

@@ -78,7 +78,16 @@ func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) e
 			a.LatencyMS = time.Since(t1).Milliseconds()
 			if started {
 				// 스트림이 시작된 뒤의 에러는 폴백하지 않고 그대로 돌려준다.
-				gt.report(err == nil)
+				// 호출자 취소·전달 실패(onLine 에러)는 provider 실패로 세지 않는다.
+				var ce *callError
+				switch {
+				case err == nil:
+					gt.report(true)
+				case ctx.Err() == nil && errors.As(err, &ce):
+					gt.report(false)
+				default:
+					gt.reportNeutral()
+				}
 				if err != nil {
 					a.Error = err.Error()
 				}
@@ -89,9 +98,16 @@ func (g *Gateway) Stream(ctx context.Context, req Request, onLine func([]byte) e
 				}
 				return r, nil
 			}
-			gt.report(false)
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
 			var ce *callError
 			errors.As(err, &ce)
+			if ce != nil && !ce.providerFault() {
+				gt.reportNeutral()
+			} else {
+				gt.report(false)
+			}
 			a.Error = err.Error()
 			if ce != nil {
 				a.Status = ce.status

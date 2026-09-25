@@ -343,3 +343,156 @@ provider = "nope"
 		t.Fatal("잘못된 설정이 통과함")
 	}
 }
+
+func TestBreakerIgnoresCallerFaults(t *testing.T) {
+	// 400(호출자 요청 오류)·검증 실패는 provider 를 막지 않는다.
+	bad := newFake(t, func(_ int64, w http.ResponseWriter) { http.Error(w, "bad request", 400) })
+	junk := newFake(t, func(_ int64, w http.ResponseWriter) { okJSON(w, "JSON 아님") })
+	pb, pj := prov(bad.srv.URL), prov(junk.srv.URL)
+	pb.BreakerFailures, pb.BreakerCooldown = 2, Duration{time.Minute}
+	pj.BreakerFailures, pj.BreakerCooldown = 2, Duration{time.Minute}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"b": pb, "j": pj},
+		Routes: map[string]*RouteConfig{
+			"bad":  {Steps: []StepConfig{{Provider: "b"}}},
+			"junk": {Steps: []StepConfig{{Provider: "j"}}, Validate: Validation{RequireJSON: true}},
+		},
+	})
+	for i := range 4 {
+		g.Call(context.Background(), userReq("bad", fmt.Sprint(i)))
+		g.Call(context.Background(), userReq("junk", fmt.Sprint(i)))
+	}
+	if bad.calls.Load() != 4 || junk.calls.Load() != 4 {
+		t.Fatalf("브레이커가 열리면 안 됨: bad %d회 junk %d회", bad.calls.Load(), junk.calls.Load())
+	}
+	st := g.Stats()
+	if st["b"].BreakerSkips != 0 || st["j"].BreakerSkips != 0 || st["b"].Fail != 4 || st["j"].Fail != 4 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestBreakerIgnoresCallerCancel(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { time.Sleep(200 * time.Millisecond); okJSON(w, "ok") })
+	p := prov(f.srv.URL)
+	p.BreakerFailures, p.BreakerCooldown = 1, Duration{time.Minute}
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": p},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a", Retries: 2}}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := g.Call(ctx, userReq("r", "취소")); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("호출자 ctx 에러여야 함: %v", err)
+	}
+	if _, err := g.Call(context.Background(), userReq("r", "다음")); err != nil {
+		t.Fatalf("호출자 취소 뒤에도 브레이커가 닫혀 있어야 함: %v", err)
+	}
+	if f.calls.Load() != 2 {
+		t.Fatalf("취소된 요청은 재시도하지 않아야 함: %d회", f.calls.Load())
+	}
+}
+
+func TestFinishReasonPropagated(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) {
+		fmt.Fprint(w, `{"model":"m","choices":[{"finish_reason":"length","message":{"content":"잘린 본문"}}]}`)
+	})
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(f.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	s := serve(t, g)
+	code, out := post(t, s.URL+"/v1/chat/completions", "", `{"model":"r","messages":[{"role":"user","content":"x"}]}`)
+	if code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	if fr := out["choices"].([]any)[0].(map[string]any)["finish_reason"]; fr != "length" {
+		t.Fatalf("finish_reason 은 provider 값(length)이어야 함: %v", fr)
+	}
+}
+
+func TestNormalizeReasoning(t *testing.T) {
+	for in, want := range map[string]string{
+		"": "", "none": "off", "OFF": "off", "minimal": "low", "low": "low", "on": "on",
+		"medium": "medium", "high": "high", "xhigh": "high", "weird": "",
+	} {
+		if got := normalizeReasoning(in); got != want {
+			t.Errorf("normalizeReasoning(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSingleflightLeaderCancelDoesNotFailFollowers(t *testing.T) {
+	f := newFake(t, func(_ int64, w http.ResponseWriter) { time.Sleep(150 * time.Millisecond); okJSON(w, "공유") })
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(f.srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() { _, err := g.Call(leaderCtx, userReq("r", "같은 요청")); leaderErr <- err }()
+	time.Sleep(30 * time.Millisecond)
+	follower := make(chan *Response, 1)
+	go func() { r, _ := g.Call(context.Background(), userReq("r", "같은 요청")); follower <- r }()
+	time.Sleep(30 * time.Millisecond)
+	cancel()
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("먼저 온 호출자는 자기 취소 에러를 받아야 함: %v", err)
+	}
+	if r := <-follower; r == nil || r.Content != "공유" || !r.Cached {
+		t.Fatalf("뒤에 붙은 호출자는 먼저 온 호출자 취소와 무관하게 결과를 받아야 함: %+v", r)
+	}
+	if f.calls.Load() != 1 {
+		t.Fatalf("upstream 1회여야 함: %d", f.calls.Load())
+	}
+}
+
+func TestSingleflightCancelledWhenAllWaitersLeave(t *testing.T) {
+	aborted := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body) // 본문을 다 읽어야 서버가 클라이언트 연결 끊김을 감지한다
+		select {
+		case <-r.Context().Done():
+			close(aborted)
+		case <-time.After(2 * time.Second):
+			okJSON(w, "늦음")
+		}
+	}))
+	t.Cleanup(srv.Close)
+	g := build(t, &Config{
+		Providers: map[string]*ProviderConfig{"a": prov(srv.URL)},
+		Routes:    map[string]*RouteConfig{"r": {Steps: []StepConfig{{Provider: "a"}}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	var wg sync.WaitGroup
+	for range 3 {
+		wg.Go(func() { g.Call(ctx, userReq("r", "모두 떠남")) })
+	}
+	wg.Wait()
+	select {
+	case <-aborted:
+	case <-time.After(time.Second):
+		t.Fatal("대기자가 모두 떠나면 upstream 호출도 취소돼야 함")
+	}
+	g.mu.Lock()
+	n := len(g.inflight)
+	g.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("취소된 flight 가 남아 있음: %d", n)
+	}
+}
+
+func TestCacheBounded(t *testing.T) {
+	g := &Gateway{cache: map[string]cacheEntry{}}
+	g.mu.Lock()
+	for i := range maxCacheEntries + 100 {
+		g.putCache(fmt.Sprint(i), &Response{Content: fmt.Sprint(i)}, time.Hour)
+	}
+	_, newest := g.cache[fmt.Sprint(maxCacheEntries+99)]
+	_, oldest := g.cache["0"]
+	n := len(g.cache)
+	g.mu.Unlock()
+	if n != maxCacheEntries || !newest || oldest {
+		t.Fatalf("캐시 %d개(상한 %d), newest=%v oldest=%v — 오래된 항목부터 버려야 함", n, maxCacheEntries, newest, oldest)
+	}
+}

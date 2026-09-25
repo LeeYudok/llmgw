@@ -34,6 +34,12 @@ type callError struct {
 	msg        string
 }
 
+// providerFault 는 실패가 provider 쪽 문제(네트워크·타임아웃·408·429·5xx·깨진 응답)인지다.
+// 호출자 요청이 잘못된 4xx 는 provider 탓이 아니므로 서킷 브레이커에 세지 않는다.
+func (e *callError) providerFault() bool {
+	return e.status == 0 || e.status == http.StatusRequestTimeout || e.status == http.StatusTooManyRequests || e.status >= 500
+}
+
 func (e *callError) Error() string {
 	if e.status > 0 {
 		return fmt.Sprintf("HTTP %d: %s", e.status, e.msg)
@@ -59,7 +65,7 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 	}
 	level := s.Reasoning
 	if level == "inherit" {
-		level = req.Reasoning
+		level = normalizeReasoning(req.Reasoning)
 		if level == "" {
 			level = "off"
 		}
@@ -104,6 +110,22 @@ func buildBody(p *ProviderConfig, s *StepConfig, req *Request) map[string]any {
 		}
 	}
 	return body
+}
+
+// normalizeReasoning 은 호출자가 보낸 추론 수준을 off|on|low|medium|high 로 맞춘다.
+// OpenAI SDK 의 "none"(추론 끔)·"minimal"·"xhigh" 도 받아들이고, 모르는 값은 "" (지정 없음)으로 본다.
+func normalizeReasoning(v string) string {
+	switch v = strings.ToLower(strings.TrimSpace(v)); v {
+	case "off", "none", "false", "disabled":
+		return "off"
+	case "minimal", "low":
+		return "low"
+	case "xhigh", "high":
+		return "high"
+	case "on", "medium":
+		return v
+	}
+	return ""
 }
 
 // responseFormatFor 는 호출자가 준 response_format 을 provider 능력에 맞춘다.

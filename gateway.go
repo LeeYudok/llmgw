@@ -34,14 +34,16 @@ type Request struct {
 
 // Response 는 최종 성공 응답과 거쳐온 시도 기록이다.
 type Response struct {
-	Content   string    `json:"content"`
-	Reasoning string    `json:"reasoning,omitempty"`
-	Provider  string    `json:"provider"`
-	Model     string    `json:"model"`
-	Usage     Usage     `json:"usage"`
-	Attempts  []Attempt `json:"attempts"`
-	Cached    bool      `json:"cached,omitempty"`
-	Latency   Duration  `json:"-"`
+	Content   string `json:"content"`
+	Reasoning string `json:"reasoning,omitempty"`
+	// FinishReason 은 provider 가 준 종료 사유(stop, length 등)다. length 면 max_tokens 에서 잘린 것이다.
+	FinishReason string    `json:"finish_reason,omitempty"`
+	Provider     string    `json:"provider"`
+	Model        string    `json:"model"`
+	Usage        Usage     `json:"usage"`
+	Attempts     []Attempt `json:"attempts"`
+	Cached       bool      `json:"cached,omitempty"`
+	Latency      Duration  `json:"-"`
 }
 
 // Attempt 는 시도 1회의 결과다. Error 가 비어 있으면 성공이다.
@@ -100,14 +102,22 @@ type Gateway struct {
 	cache    map[string]cacheEntry
 }
 
+// flight 는 같은 요청을 한 번만 호출하는 공유 호출이다. 호출은 기다리는 사람이 한 명이라도 남아 있는 동안
+// 계속되고, 모두 떠나면(각자 ctx 취소) 그때 취소된다 — 먼저 온 호출자가 취소해도 뒤에 붙은 호출자는 영향이 없다.
 type flight struct {
-	done chan struct{}
-	resp *Response
-	err  error
+	done    chan struct{}
+	resp    *Response
+	err     error
+	waiters int                // g.mu 로 보호
+	cancel  context.CancelFunc // 마지막 대기자가 떠날 때 호출
 }
+
+// maxCacheEntries 는 응답 캐시의 최대 항목 수다. 넘치면 만료된 항목을, 그래도 넘치면 오래된 항목부터 버린다.
+const maxCacheEntries = 1024
 
 type cacheEntry struct {
 	resp    *Response
+	added   time.Time
 	expires time.Time
 }
 
@@ -193,42 +203,79 @@ func (g *Gateway) callRoute(ctx context.Context, route *RouteConfig, req Request
 		r.Cached = true
 		return &r, nil
 	}
-	if f, ok := g.inflight[key]; ok {
-		g.mu.Unlock()
-		select {
-		case <-f.done:
-			if f.err != nil {
-				return nil, f.err
-			}
-			r := *f.resp
-			r.Cached = true
-			return &r, nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	f, joined := g.inflight[key]
+	if !joined {
+		// 호출은 첫 호출자의 ctx 와 떼어 낸다(값은 유지). 취소는 대기자가 모두 떠났을 때만 한다.
+		fctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		f = &flight{done: make(chan struct{}), cancel: cancel}
+		g.inflight[key] = f
+		go g.fly(fctx, key, f, route, req)
 	}
-	f := &flight{done: make(chan struct{})}
-	g.inflight[key] = f
+	f.waiters++
 	g.mu.Unlock()
 
+	select {
+	case <-f.done:
+		if f.err != nil {
+			return nil, f.err
+		}
+		if !joined {
+			return f.resp, nil
+		}
+		r := *f.resp
+		r.Cached = true
+		return &r, nil
+	case <-ctx.Done():
+		g.mu.Lock()
+		f.waiters--
+		if f.waiters == 0 {
+			f.cancel()
+			if g.inflight[key] == f {
+				delete(g.inflight, key) // 취소된 호출에 새 요청이 붙지 않게
+			}
+		}
+		g.mu.Unlock()
+		return nil, ctx.Err()
+	}
+}
+
+// fly 는 공유 호출을 실행하고 결과를 캐시에 넣은 뒤 대기자에게 알린다.
+func (g *Gateway) fly(ctx context.Context, key string, f *flight, route *RouteConfig, req Request) {
+	defer f.cancel()
 	f.resp, f.err = g.run(ctx, route, req)
 
 	g.mu.Lock()
-	delete(g.inflight, key)
+	if g.inflight[key] == f {
+		delete(g.inflight, key)
+	}
 	if f.err == nil && route.CacheTTL.Duration > 0 {
-		now := time.Now()
-		if len(g.cache) >= 1024 { // 만료된 항목만 걷어낸다(상한 없는 증가 방지)
-			for k, e := range g.cache {
-				if now.After(e.expires) {
-					delete(g.cache, k)
-				}
-			}
-		}
-		g.cache[key] = cacheEntry{resp: f.resp, expires: now.Add(route.CacheTTL.Duration)}
+		g.putCache(key, f.resp, route.CacheTTL.Duration)
 	}
 	g.mu.Unlock()
 	close(f.done)
-	return f.resp, f.err
+}
+
+// putCache 는 g.mu 를 잡은 채로 부른다. 항목 수가 maxCacheEntries 를 넘지 않게 한다.
+func (g *Gateway) putCache(key string, resp *Response, ttl time.Duration) {
+	now := time.Now()
+	if _, ok := g.cache[key]; !ok && len(g.cache) >= maxCacheEntries {
+		for k, e := range g.cache {
+			if now.After(e.expires) {
+				delete(g.cache, k)
+			}
+		}
+		for len(g.cache) >= maxCacheEntries { // 만료된 것이 없으면 가장 오래된 항목부터 버린다
+			var oldest string
+			var at time.Time
+			for k, e := range g.cache {
+				if oldest == "" || e.added.Before(at) {
+					oldest, at = k, e.added
+				}
+			}
+			delete(g.cache, oldest)
+		}
+	}
+	g.cache[key] = cacheEntry{resp: resp, added: now, expires: now.Add(ttl)}
 }
 
 func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Response, error) {
@@ -272,7 +319,7 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					verr = checkSchema(c.content, schemaOf(req.ResponseFormat))
 				}
 				if verr != nil {
-					gt.report(false)
+					gt.reportNeutral() // 요청 내용에 따라 갈리는 실패라 provider 전체를 막지 않는다
 					a.Error = "검증 실패: " + verr.Error()
 					attempts = append(attempts, a)
 					break // 같은 설정으로 다시 불러도 같은 결과일 가능성이 커서 다음 step 으로
@@ -283,14 +330,21 @@ func (g *Gateway) run(ctx context.Context, route *RouteConfig, req Request) (*Re
 					c.model = model
 				}
 				return &Response{
-					Content: c.content, Reasoning: c.reasoning, Provider: s.Provider, Model: c.model,
+					Content: c.content, Reasoning: c.reasoning, FinishReason: c.finish, Provider: s.Provider, Model: c.model,
 					Usage: c.usage, Attempts: attempts, Latency: Duration{time.Since(start)},
 				}, nil
 			}
 
-			gt.report(false)
+			if ctx.Err() != nil {
+				return nil, ctx.Err() // 호출자 취소는 provider 실패로 세지 않는다
+			}
 			var ce *callError
 			errors.As(err, &ce)
+			if ce != nil && !ce.providerFault() {
+				gt.reportNeutral()
+			} else {
+				gt.report(false)
+			}
 			a.Error = err.Error()
 			if ce != nil {
 				a.Status = ce.status
